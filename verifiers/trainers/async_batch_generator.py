@@ -22,6 +22,7 @@ class BatchRequest:
     process_index: int
     num_processes: int
     local_batch_size: int
+    lora_adapter_name: Optional[str] = None  # LoRA adapter to use for this batch
 
 
 @dataclass
@@ -220,11 +221,14 @@ class AsyncBatchGenerator:
         """
         Generate a single batch. This runs in the worker thread.
         """
+        # Use LoRA adapter name if provided in request, otherwise use default model name
+        model_name = request.lora_adapter_name if request.lora_adapter_name else self.model_name
+        
         # Call environment generation
         env_results = self.env.generate(
             request.env_inputs,
             client=self.client,
-            model=self.model_name,
+            model=model_name,
             sampling_args=self.sampling_args,
             score_rollouts=True,
             max_concurrent=request.max_concurrent,

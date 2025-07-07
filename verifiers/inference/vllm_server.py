@@ -405,6 +405,37 @@ class ScriptArguments:
         default=64,
         metadata={"help": "Number of tokens to generate per iteration in token-chunk dynamic batching."},
     )
+    
+    # LoRA parameters
+    enable_lora: bool = field(
+        default=False,
+        metadata={"help": "Whether to enable LoRA adapters. If True, vLLM will support LoRA inference."},
+    )
+    max_loras: int = field(
+        default=1,
+        metadata={
+            "help": "Maximum number of LoRA adapters that can be used in the same batch. "
+            "Larger numbers will cause higher memory usage."
+        },
+    )
+    max_lora_rank: int = field(
+        default=64,
+        metadata={
+            "help": "Maximum supported rank of all LoRAs. Larger numbers will cause higher memory usage. "
+            "If you know that all LoRAs will use the same rank, set this as low as possible."
+        },
+    )
+    max_cpu_loras: int = field(
+        default=2,
+        metadata={"help": "Maximum number of LoRA adapters to store in CPU memory."},
+    )
+    lora_modules: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "LoRA module configuration in JSON format. "
+            "Example: '{\"sql-lora\": \"/path/to/lora\", \"math-lora\": \"/path/to/math-lora\"}'"
+        },
+    )
 
 # Global/module-level variables for token-chunk dynamic batching
 _SAMPLING_PARAM_NAMES: Optional[frozenset[str]] = None
@@ -535,18 +566,42 @@ def llm_worker(
     os.environ["VLLM_DP_SIZE"] = str(script_args.data_parallel_size)
     os.environ["VLLM_DP_MASTER_PORT"] = str(master_port)
 
-    llm = LLM(
-        model=script_args.model,
-        revision=script_args.revision,
-        tensor_parallel_size=script_args.tensor_parallel_size,
-        gpu_memory_utilization=script_args.gpu_memory_utilization,
-        enforce_eager=script_args.enforce_eager,
-        dtype=script_args.dtype,
-        enable_prefix_caching=script_args.enable_prefix_caching,
-        max_model_len=script_args.max_model_len,
-        max_num_seqs=script_args.max_batch_size,
-        worker_extension_cls="verifiers.inference.vllm_server.WeightSyncWorkerExtension",
-    )
+    # Parse LoRA modules if provided
+    lora_modules_dict = None
+    if script_args.lora_modules:
+        import json
+        try:
+            lora_modules_dict = json.loads(script_args.lora_modules)
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse lora_modules JSON: {e}")
+            raise ValueError(f"Invalid lora_modules JSON format: {e}")
+    
+    # Build LLM constructor arguments
+    llm_kwargs = {
+        "model": script_args.model,
+        "revision": script_args.revision,
+        "tensor_parallel_size": script_args.tensor_parallel_size,
+        "gpu_memory_utilization": script_args.gpu_memory_utilization,
+        "enforce_eager": script_args.enforce_eager,
+        "dtype": script_args.dtype,
+        "enable_prefix_caching": script_args.enable_prefix_caching,
+        "max_model_len": script_args.max_model_len,
+        "max_num_seqs": script_args.max_batch_size,
+        "worker_extension_cls": "verifiers.inference.vllm_server.WeightSyncWorkerExtension",
+    }
+    
+    # Add LoRA parameters if enabled
+    if script_args.enable_lora:
+        llm_kwargs.update({
+            "enable_lora": True,
+            "max_loras": script_args.max_loras,
+            "max_lora_rank": script_args.max_lora_rank,
+            "max_cpu_loras": script_args.max_cpu_loras,
+        })
+        if lora_modules_dict:
+            llm_kwargs["lora_modules"] = lora_modules_dict
+    
+    llm = LLM(**llm_kwargs)
 
     # Send ready signal to parent process
     connection.send({"status": "ready"})
@@ -1828,6 +1883,139 @@ def main(script_args: ScriptArguments):
                 # Don't fail the request if we can't notify a worker during shutdown
         
         return {"message": "Request received, closing communicator"}
+    
+    # LoRA management endpoints
+    class LoadLoRARequest(BaseModel):
+        lora_name: str
+        lora_path: str
+        
+    class UnloadLoRARequest(BaseModel):
+        lora_name: str
+    
+    @app.post("/load_lora/")
+    async def load_lora(request: LoadLoRARequest):
+        """
+        Load a LoRA adapter into the model.
+        
+        Args:
+            request: Contains lora_name and lora_path
+        """
+        if not script_args.enable_lora:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "LoRA is not enabled on this server. Start with --enable-lora to use LoRA adapters."}
+            )
+        
+        try:
+            # Send load_lora command to all workers
+            results = []
+            for i, connection in enumerate(connections):
+                try:
+                    connection.send({
+                        "type": "call", 
+                        "method": "load_lora",
+                        "kwargs": {"lora_request": {"lora_name": request.lora_name, "lora_path": request.lora_path}}
+                    })
+                    result = connection.recv()
+                    if isinstance(result, dict) and "error" in result:
+                        raise Exception(f"Worker {i} error: {result['error']}")
+                    results.append(result)
+                except Exception as e:
+                    logger.error(f"Failed to load LoRA on worker {i}: {e}")
+                    return JSONResponse(
+                        status_code=500,
+                        content={"error": f"Failed to load LoRA on worker {i}: {str(e)}"}
+                    )
+            
+            logger.info(f"Successfully loaded LoRA adapter '{request.lora_name}' from '{request.lora_path}'")
+            return {"message": f"LoRA adapter '{request.lora_name}' loaded successfully", "results": results}
+            
+        except Exception as e:
+            logger.error(f"Error loading LoRA adapter: {e}")
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"Failed to load LoRA adapter: {str(e)}"}
+            )
+    
+    @app.post("/unload_lora/")
+    async def unload_lora(request: UnloadLoRARequest):
+        """
+        Unload a LoRA adapter from the model.
+        
+        Args:
+            request: Contains lora_name to unload
+        """
+        if not script_args.enable_lora:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "LoRA is not enabled on this server. Start with --enable-lora to use LoRA adapters."}
+            )
+        
+        try:
+            # Send unload_lora command to all workers
+            results = []
+            for i, connection in enumerate(connections):
+                try:
+                    connection.send({
+                        "type": "call",
+                        "method": "unload_lora", 
+                        "kwargs": {"lora_id": request.lora_name}
+                    })
+                    result = connection.recv()
+                    if isinstance(result, dict) and "error" in result:
+                        raise Exception(f"Worker {i} error: {result['error']}")
+                    results.append(result)
+                except Exception as e:
+                    logger.error(f"Failed to unload LoRA on worker {i}: {e}")
+                    return JSONResponse(
+                        status_code=500,
+                        content={"error": f"Failed to unload LoRA on worker {i}: {str(e)}"}
+                    )
+            
+            logger.info(f"Successfully unloaded LoRA adapter '{request.lora_name}'")
+            return {"message": f"LoRA adapter '{request.lora_name}' unloaded successfully", "results": results}
+            
+        except Exception as e:
+            logger.error(f"Error unloading LoRA adapter: {e}")
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"Failed to unload LoRA adapter: {str(e)}"}
+            )
+    
+    @app.get("/list_loras/")
+    async def list_loras():
+        """
+        List all currently loaded LoRA adapters.
+        """
+        if not script_args.enable_lora:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "LoRA is not enabled on this server. Start with --enable-lora to use LoRA adapters."}
+            )
+        
+        try:
+            # Get list from first worker (all workers should have the same LoRAs loaded)
+            if connections:
+                connection = connections[0]
+                connection.send({
+                    "type": "call",
+                    "method": "list_loras"
+                })
+                result = connection.recv()
+                if isinstance(result, dict) and "error" in result:
+                    raise Exception(f"Worker error: {result['error']}")
+                
+                logger.debug(f"Listed LoRA adapters: {result}")
+                return {"lora_adapters": result}
+            else:
+                return {"lora_adapters": []}
+                
+        except Exception as e:
+            logger.error(f"Error listing LoRA adapters: {e}")
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"Failed to list LoRA adapters: {str(e)}"}
+            )
 
     # Start the server
     # Always use 1 Uvicorn worker. vLLM handles its own worker processes and scheduling.
@@ -1884,6 +2072,18 @@ def make_parser():
     parser.add_argument("--token-chunk-size", type=int, default=64,
                         help="Number of tokens to generate per iteration per request in token-chunk dynamic batching.")
     
+    # LoRA arguments
+    parser.add_argument("--enable-lora", action="store_true", default=False,
+                        help="Whether to enable LoRA adapters. If True, vLLM will support LoRA inference.")
+    parser.add_argument("--max-loras", type=int, default=1,
+                        help="Maximum number of LoRA adapters that can be used in the same batch. Larger numbers will cause higher memory usage.")
+    parser.add_argument("--max-lora-rank", type=int, default=64,
+                        help="Maximum supported rank of all LoRAs. Larger numbers will cause higher memory usage.")
+    parser.add_argument("--max-cpu-loras", type=int, default=2,
+                        help="Maximum number of LoRA adapters to store in CPU memory.")
+    parser.add_argument("--lora-modules", type=str, default=None,
+                        help="LoRA module configuration in JSON format. Example: '{\"sql-lora\": \"/path/to/lora\"}'")
+    
     return parser
 
 def cli_main():
@@ -1908,7 +2108,12 @@ def cli_main():
         log_level=args.log_level,
         max_batch_size=args.max_batch_size,
         batch_request_timeout_seconds=args.batch_request_timeout_seconds,
-        token_chunk_size=args.token_chunk_size
+        token_chunk_size=args.token_chunk_size,
+        enable_lora=args.enable_lora,
+        max_loras=args.max_loras,
+        max_lora_rank=args.max_lora_rank,
+        max_cpu_loras=args.max_cpu_loras,
+        lora_modules=args.lora_modules
     )
     
     main(script_args)

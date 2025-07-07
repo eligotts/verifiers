@@ -166,12 +166,15 @@ class Environment(ABC):
                            sampling_args: Dict[str, Any] = {},
                            message_type: Literal['chat', 'completion'] | None = None,
                            sanitize_sampling_args: bool = True,
+                           lora_adapter_name: str | None = None,
+                           lora_adapter_id: int | None = None,
                            **kwargs: Any) -> str:
         """
         Get model response for a given prompt (chat or completion).
         
         Convenience function for wrapping (chat, completion) API calls.
         Returns special error messages for context length issues.
+        Supports LoRA adapters via lora_adapter_name and lora_adapter_id parameters.
         """
         if sanitize_sampling_args:
             sanitized_args = self.sanitize_sampling_args(client, sampling_args)
@@ -179,6 +182,18 @@ class Environment(ABC):
             sanitized_args = sampling_args
         if message_type is None:
             message_type = self.message_type
+        
+        # Add LoRA request to extra_body if specified
+        if lora_adapter_name is not None:
+            if 'extra_body' not in sanitized_args:
+                sanitized_args['extra_body'] = {}
+            
+            # Create LoRA request object
+            lora_request = {
+                'lora_name': lora_adapter_name,
+                'lora_int_id': lora_adapter_id or 1  # Default to ID 1 if not specified
+            }
+            sanitized_args['extra_body']['lora_request'] = lora_request
 
         try:
             if message_type == 'chat':
@@ -220,6 +235,8 @@ class Environment(ABC):
                 task: str = "default",
                 info: Dict[str, Any] = {},
                 sampling_args: Dict[str, Any] = {},
+                lora_adapter_name: str | None = None,
+                lora_adapter_id: int | None = None,
                 **kwargs: Any) -> Tuple[Union[str, List[Dict[str, Any]]], Dict[str, Any]]:
         """
         Run a rollout for a given prompt.
@@ -236,13 +253,16 @@ class Environment(ABC):
                           task: str = "default",
                           info: Dict[str, Any] = {},
                           sampling_args: Dict[str, Any] = {},
+                          lora_adapter_name: str | None = None,
+                          lora_adapter_id: int | None = None,
                           **kwargs: Any) -> Tuple[Union[str, List[Dict[str, Any]]], Dict[str, Any]]:
         """
         Run a rollout for a given prompt.
         Returns a tuple of (completion, state).
         """
         async with semaphore:
-            return await asyncio.to_thread(self.rollout, client, model, prompt, answer, task, info, sampling_args, **kwargs)
+            return await asyncio.to_thread(self.rollout, client, model, prompt, answer, task, info, 
+                                         sampling_args, lora_adapter_name, lora_adapter_id, **kwargs)
 
     async def _run_all(self,
                        client: OpenAI,
@@ -260,7 +280,8 @@ class Environment(ABC):
         from tqdm.asyncio import tqdm_asyncio
         semaphore = Semaphore(max_concurrent)
         rollout_tasks = [
-            self._run_single(semaphore, client, model, prompt, answer, task, info, sampling_args, **kwargs)
+            self._run_single(semaphore, client, model, prompt, answer, task, info, sampling_args, 
+                           lora_adapter_name, lora_adapter_id, **kwargs)
             for prompt, answer, task, info in zip(prompts, answers, tasks, infos)
         ]
         return await tqdm_asyncio.gather(
@@ -278,6 +299,8 @@ class Environment(ABC):
                      infos: List[Dict[str, Any]] = [],
                      sampling_args: Dict[str, Any] = {},
                      max_concurrent: int = DEFAULT_MAX_CONCURRENT,
+                     lora_adapter_name: str | None = None,
+                     lora_adapter_id: int | None = None,
                      **kwargs: Any) -> List[Tuple[Union[str, List[Dict[str, Any]]], Dict[str, Any]]]:
         """
         Run rollouts for a given list of prompts and return the completions.
@@ -323,6 +346,8 @@ class Environment(ABC):
                  sampling_args: Dict[str, Any] = {},
                  max_concurrent: int | None = None,
                  score_rollouts: bool = True,
+                 lora_adapter_name: str | None = None,
+                 lora_adapter_id: int | None = None,
                  **kwargs: Any) -> Dict[str, Any]:
         """
         Generate completions and rewards for a given set of inputs.
@@ -365,6 +390,8 @@ class Environment(ABC):
             model=model,
             sampling_args=gen_sampling_args,
             max_concurrent=max_concurrent,
+            lora_adapter_name=lora_adapter_name,
+            lora_adapter_id=lora_adapter_id,
             **kwargs
         )
         results['completion'] = [rollout[0] for rollout in rollouts]

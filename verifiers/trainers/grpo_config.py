@@ -315,9 +315,50 @@ class GRPOConfig(TrainingArguments):
             "all prompts are logged."
         },
     )
+    
+    # LoRA parameters
+    lora_adapter_name: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Name of the LoRA adapter to use for generation. If provided, this LoRA will be used "
+            "instead of the base model for rollout generation."
+        },
+    )
+    lora_adapter_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to the LoRA adapter files. Required if lora_adapter_name is provided and "
+            "enable_dynamic_lora is True."
+        },
+    )
+    enable_dynamic_lora: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to enable dynamic LoRA loading during training. If True, LoRA adapters can be "
+            "loaded and unloaded at runtime. Requires VLLM_ALLOW_RUNTIME_LORA_UPDATING=True."
+        },
+    )
+    lora_adapter_auto_load: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to automatically load the LoRA adapter before generation phases. If False, "
+            "the LoRA must be loaded manually or already present in the vLLM server."
+        },
+    )
 
     def __post_init__(self):
         super().__post_init__()
+        
+        # Validate LoRA configuration
+        if self.lora_adapter_name and self.enable_dynamic_lora and not self.lora_adapter_path:
+            raise ValueError(
+                "lora_adapter_path is required when lora_adapter_name is provided and enable_dynamic_lora is True"
+            )
+        
+        if self.lora_adapter_path and not self.lora_adapter_name:
+            raise ValueError(
+                "lora_adapter_name is required when lora_adapter_path is provided"
+            )
 
         num_processes = self.world_size
         # The current default effective batch size

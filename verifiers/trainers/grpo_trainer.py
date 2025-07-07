@@ -368,6 +368,12 @@ class GRPOTrainer(Trainer):
         # Environment integration parameters
         self.mask_env_responses = args.mask_env_responses
         self.max_concurrent = args.max_concurrent
+        
+        # LoRA parameters
+        self.lora_adapter_name = args.lora_adapter_name
+        self.lora_adapter_path = args.lora_adapter_path
+        self.enable_dynamic_lora = args.enable_dynamic_lora
+        self.lora_adapter_auto_load = args.lora_adapter_auto_load
 
         # maxlen is set to the total number of forward passes per step. This value of `maxlen` ensures we log only the
         # final optimization step.
@@ -411,6 +417,10 @@ class GRPOTrainer(Trainer):
         # desynchronization and seems to lead to DeepSpeed hanging during initialization. To prevent this, we
         # synchronize all processes after vLLM has been fully initialized.
         self.accelerator.wait_for_everyone()
+        
+        # Initialize LoRA state tracking
+        self._lora_loaded = False
+        self._current_lora_name = None
 
         # Reference model
         if self.ref_model is not None:
@@ -543,6 +553,10 @@ class GRPOTrainer(Trainer):
             if self.async_generator and self._async_started and self.accelerator.is_main_process:
                 self.async_generator.stop()
             self._async_started = False
+            
+            # Clean up LoRA adapters on main process
+            if self.accelerator.is_main_process:
+                self._unload_lora_if_needed()
 
     def _get_last_hidden_state(self, unwrapped_model, input_ids, attention_mask, logits_to_keep=None):
         if is_peft_model(unwrapped_model):
@@ -647,7 +661,138 @@ class GRPOTrainer(Trainer):
 
     def _get_model_name(self) -> str:
         """Get model name for Environment generation."""
+        # Use LoRA adapter name if configured, otherwise use base model name
+        if self.lora_adapter_name:
+            return self.lora_adapter_name
         return self.model.config._name_or_path # type: ignore
+    
+    def _ensure_lora_loaded(self):
+        """
+        Ensure the LoRA adapter is loaded in vLLM if dynamic LoRA is enabled.
+        Only called on the main process.
+        """
+        if not self.accelerator.is_main_process:
+            return
+            
+        # Check if we need to load a LoRA
+        if (self.lora_adapter_name and 
+            self.enable_dynamic_lora and 
+            self.lora_adapter_auto_load and 
+            not self._lora_loaded):
+            
+            if not self.lora_adapter_path:
+                raise ValueError(
+                    f"lora_adapter_path is required for dynamic LoRA loading of {self.lora_adapter_name}"
+                )
+            
+            try:
+                self.logger.info(f"Loading LoRA adapter '{self.lora_adapter_name}' from '{self.lora_adapter_path}'")
+                result = self.vllm_client.load_lora(self.lora_adapter_name, self.lora_adapter_path)
+                self.logger.info(f"LoRA adapter loaded successfully: {result.get('message', 'Success')}")
+                self._lora_loaded = True
+                self._current_lora_name = self.lora_adapter_name
+                
+            except Exception as e:
+                self.logger.error(f"Failed to load LoRA adapter '{self.lora_adapter_name}': {e}")
+                raise RuntimeError(f"LoRA loading failed: {e}")
+    
+    def _unload_lora_if_needed(self):
+        """
+        Unload the current LoRA adapter if dynamic LoRA is enabled.
+        Only called on the main process.
+        """
+        if not self.accelerator.is_main_process:
+            return
+            
+        if (self.enable_dynamic_lora and 
+            self._lora_loaded and 
+            self._current_lora_name):
+            
+            try:
+                self.logger.info(f"Unloading LoRA adapter '{self._current_lora_name}'")
+                result = self.vllm_client.unload_lora(self._current_lora_name)
+                self.logger.info(f"LoRA adapter unloaded successfully: {result.get('message', 'Success')}")
+                self._lora_loaded = False
+                self._current_lora_name = None
+                
+            except Exception as e:
+                self.logger.warning(f"Failed to unload LoRA adapter '{self._current_lora_name}': {e}")
+                # Don't raise here as this is cleanup - just log the warning
+    
+    def load_lora_adapter(self, lora_name: str, lora_path: str, auto_unload_previous: bool = True):
+        """
+        Manually load a LoRA adapter. Only callable on the main process.
+        
+        Args:
+            lora_name: Name/identifier for the LoRA adapter
+            lora_path: Path to the LoRA adapter files  
+            auto_unload_previous: Whether to automatically unload the previously loaded LoRA
+        """
+        if not self.accelerator.is_main_process:
+            self.logger.warning("load_lora_adapter can only be called on the main process")
+            return
+            
+        # Unload previous LoRA if requested
+        if auto_unload_previous and self._lora_loaded:
+            self._unload_lora_if_needed()
+        
+        try:
+            self.logger.info(f"Manually loading LoRA adapter '{lora_name}' from '{lora_path}'")
+            result = self.vllm_client.load_lora(lora_name, lora_path)
+            self.logger.info(f"LoRA adapter loaded successfully: {result.get('message', 'Success')}")
+            self._lora_loaded = True
+            self._current_lora_name = lora_name
+            
+        except Exception as e:
+            self.logger.error(f"Failed to manually load LoRA adapter '{lora_name}': {e}")
+            raise RuntimeError(f"Manual LoRA loading failed: {e}")
+    
+    def unload_lora_adapter(self, lora_name: Optional[str] = None):
+        """
+        Manually unload a LoRA adapter. Only callable on the main process.
+        
+        Args:
+            lora_name: Specific LoRA to unload. If None, unloads the currently tracked LoRA.
+        """
+        if not self.accelerator.is_main_process:
+            self.logger.warning("unload_lora_adapter can only be called on the main process")
+            return
+            
+        target_lora = lora_name or self._current_lora_name
+        if not target_lora:
+            self.logger.warning("No LoRA adapter to unload")
+            return
+            
+        try:
+            self.logger.info(f"Manually unloading LoRA adapter '{target_lora}'")
+            result = self.vllm_client.unload_lora(target_lora)
+            self.logger.info(f"LoRA adapter unloaded successfully: {result.get('message', 'Success')}")
+            
+            # Update tracking if we unloaded the current one
+            if target_lora == self._current_lora_name:
+                self._lora_loaded = False
+                self._current_lora_name = None
+                
+        except Exception as e:
+            self.logger.error(f"Failed to manually unload LoRA adapter '{target_lora}': {e}")
+            raise RuntimeError(f"Manual LoRA unloading failed: {e}")
+    
+    def list_loaded_loras(self):
+        """
+        List all currently loaded LoRA adapters. Only callable on the main process.
+        
+        Returns:
+            list: List of loaded LoRA adapter names
+        """
+        if not self.accelerator.is_main_process:
+            self.logger.warning("list_loaded_loras can only be called on the main process")
+            return []
+            
+        try:
+            return self.vllm_client.list_loras()
+        except Exception as e:
+            self.logger.error(f"Failed to list LoRA adapters: {e}")
+            return []
 
     def _ids_to_tensors(self,
                         prompt_ids: List[List[int]],
@@ -725,6 +870,11 @@ class GRPOTrainer(Trainer):
                 self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
             
+            # Ensure LoRA is loaded if needed (main process only)
+            if self.accelerator.is_main_process:
+                self._ensure_lora_loaded()
+            self.accelerator.wait_for_everyone()
+            
             # Start async generator if not started
             if not self._async_started and self.accelerator.is_main_process:
                 self.async_generator.start()
@@ -764,6 +914,7 @@ class GRPOTrainer(Trainer):
                         process_index=self.accelerator.process_index,
                         num_processes=self.accelerator.num_processes,
                         local_batch_size=local_batch_size,
+                        lora_adapter_name=self.lora_adapter_name,  # Pass LoRA adapter name if configured
                     )
                     self.async_generator.submit_batch(request)
                     self.logger.info(f"Submitted batch {batch_id} with {len(all_prompts)} prompts (num processes: {self.accelerator.num_processes})")

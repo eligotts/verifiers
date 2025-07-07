@@ -315,6 +315,62 @@ class VLLMClient(OpenAI):
         response = self.session.post(url)
         if response.status_code != 200:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
+    
+    def load_lora(self, lora_name: str, lora_path: str):
+        """
+        Load a LoRA adapter into the vLLM model.
+        
+        Args:
+            lora_name (str): Name/identifier for the LoRA adapter
+            lora_path (str): Path to the LoRA adapter files
+            
+        Returns:
+            dict: Server response containing success message and results
+            
+        Raises:
+            Exception: If the load operation fails
+        """
+        url = f"http://{self.host}:{self.server_port}/load_lora/"
+        response = self.session.post(url, json={"lora_name": lora_name, "lora_path": lora_path})
+        if response.status_code != 200:
+            raise Exception(f"LoRA load failed: {response.status_code}, {response.text}")
+        return response.json()
+    
+    def unload_lora(self, lora_name: str):
+        """
+        Unload a LoRA adapter from the vLLM model.
+        
+        Args:
+            lora_name (str): Name/identifier of the LoRA adapter to unload
+            
+        Returns:
+            dict: Server response containing success message and results
+            
+        Raises:
+            Exception: If the unload operation fails
+        """
+        url = f"http://{self.host}:{self.server_port}/unload_lora/"
+        response = self.session.post(url, json={"lora_name": lora_name})
+        if response.status_code != 200:
+            raise Exception(f"LoRA unload failed: {response.status_code}, {response.text}")
+        return response.json()
+    
+    def list_loras(self):
+        """
+        List all currently loaded LoRA adapters.
+        
+        Returns:
+            list: List of currently loaded LoRA adapter names
+            
+        Raises:
+            Exception: If the list operation fails
+        """
+        url = f"http://{self.host}:{self.server_port}/list_loras/"
+        response = self.session.get(url)
+        if response.status_code != 200:
+            raise Exception(f"LoRA list failed: {response.status_code}, {response.text}")
+        result = response.json()
+        return result.get("lora_adapters", [])
 
     def close_communicator(self):
         """
