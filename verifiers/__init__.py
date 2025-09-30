@@ -8,6 +8,13 @@ from typing import TYPE_CHECKING, Optional
 from .types import *  # noqa # isort: skip
 from .envs.env_group import EnvGroup
 from .envs.environment import Environment
+from .envs.gepa_environment import GepaEnvironment
+from .envs.gepa_manager import (
+    GEPAUpdateResult,
+    GepaPromptManager,
+    PromptEvalRecord,
+    PromptEvaluation,
+)
 from .envs.multiturn_env import MultiTurnEnv
 from .envs.singleturn_env import SingleTurnEnv
 from .envs.stateful_tool_env import StatefulToolEnv
@@ -82,6 +89,11 @@ __all__ = [
     "SandboxEnv",
     "StatefulToolEnv",
     "ToolEnv",
+    "GepaEnvironment",
+    "GepaPromptManager",
+    "PromptEvalRecord",
+    "PromptEvaluation",
+    "GEPAUpdateResult",
     "EnvGroup",
     "extract_boxed_answer",
     "extract_hash_answer",
