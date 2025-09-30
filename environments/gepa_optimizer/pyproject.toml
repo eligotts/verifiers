@@ -1,0 +1,11 @@
+[project]
+name = "gepa-optimizer-env"
+version = "0.0.1"
+description = "GEPA-integrated verifiers environment"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets",
+]
+
+[tool.setuptools]
+packages = ["gepa_optimizer"]

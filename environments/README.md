@@ -18,6 +18,7 @@ This folder contains installable example environments that showcase common usage
 - **summarize_text**: Multiple rewards (length/format + similarity) combined in one `Rubric`.
 - **continuation_quality**: Completion-style generation (`message_type="completion"`) judged for prose quality with `JudgeRubric`.
 - **mmmu**: Multimodal inputs (image + text) packed in chat content; single-turn boxed-answer check.
+- **gepa_optimizer**: Demonstrates in-loop GEPA prompt evolution with dynamic system prompt selection and reward modulation.
 
 ### SingleTurnEnv subclass (custom dataset/scoring wrappers)
 - **reasoning_gym_env**: Wraps `reasoning_gym` procedural datasets, converts to HF datasets, uses `XMLParser` and task-specific scoring.
