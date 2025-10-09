@@ -540,36 +540,77 @@ class GepaEnvironment(SingleTurnEnv):
         if not update_result.accepted:
             return
         new_avg = update_result.evaluation.average()
+
+        # Determine if we should mask negative advantages
+        should_mask = new_avg >= current_avg + self.improvement_margin
+
         for i in range(len(results.prompt)):
             results.metrics["gepa_accepted"][i] = 1.0
             results.state[i]["gepa"]["val_score"] = new_avg
             results.state[i]["gepa"]["improvements"] = update_result.improvements
+            results.state[i]["gepa"]["should_mask_negatives"] = should_mask
             results.info[i]["gepa"]["val_score"] = new_avg
-        if new_avg >= current_avg + self.improvement_margin:
-            shrink = self.reward_shrink_factor
-            if shrink < 1.0 and shrink > 0.0:
-                adjusted = self._shrink_rewards(results.reward, shrink)
-                results.reward[:] = adjusted
 
-    def _shrink_rewards(self, rewards: list[float], factor: float) -> list[float]:
-        n = len(rewards)
-        if n == 0:
-            return rewards
+    def process_env_results_vllm(
+        self,
+        prompts: list[Messages],
+        completions: list[Messages],
+        states: list[State],
+        rewards: list[float],
+        processing_class: Any,
+        max_seq_len: int = -1,
+        mask_env_responses: bool = False,
+        mask_truncated_completions: bool = False,
+        zero_truncated_completions: bool = False,
+    ) -> Any:
+        """
+        Override to mask negative-advantage completions when GEPA improves.
+
+        When the new GEPA prompt performs well (improves beyond improvement_margin),
+        we mask out completions that would have negative advantages. This minimizes
+        weight updates for those rollouts since masked tokens don't contribute to the loss.
+        """
+        # Call parent to get normal processing
+        result = super().process_env_results_vllm(
+            prompts=prompts,
+            completions=completions,
+            states=states,
+            rewards=rewards,
+            processing_class=processing_class,
+            max_seq_len=max_seq_len,
+            mask_env_responses=mask_env_responses,
+            mask_truncated_completions=mask_truncated_completions,
+            zero_truncated_completions=zero_truncated_completions,
+        )
+
+        # Check if we should mask negative advantages
+        # (this is set in _apply_post_update_logic when GEPA improves)
+        should_mask = any(
+            state.get("gepa", {}).get("should_mask_negatives", False)
+            for state in states
+        )
+
+        if not should_mask:
+            return result
+
+        # Compute advantages and mask negative ones
+        # In GRPO, advantages are computed as: reward - mean(rewards_in_group)
+        # So if reward < mean, the advantage will be negative
         generations = int(self.sampling_args.get("n", 1))
-        adjusted = rewards.copy()
-        if generations <= 1:
-            mean = sum(rewards) / n
-            for idx, value in enumerate(rewards):
-                adjusted[idx] = mean + factor * (value - mean)
-            return adjusted
-        for start in range(0, n, generations):
+        for start in range(0, len(rewards), generations):
             chunk = rewards[start : start + generations]
             if not chunk:
                 continue
             mean = sum(chunk) / len(chunk)
-            for i, value in enumerate(chunk):
-                adjusted[start + i] = mean + factor * (value - mean)
-        return adjusted
+
+            for i, reward in enumerate(chunk):
+                if reward < mean:  # This rollout would have negative advantage
+                    # Zero out completion mask for this rollout to prevent weight updates
+                    result.completion_mask[start + i] = [0] * len(
+                        result.completion_mask[start + i]
+                    )
+
+        return result
 
 
 __all__ = ["GepaEnvironment"]
