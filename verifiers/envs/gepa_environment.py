@@ -544,6 +544,10 @@ class GepaEnvironment(SingleTurnEnv):
         # Determine if we should mask negative advantages
         should_mask = new_avg >= current_avg + self.improvement_margin
 
+        self.logger.info(f"[GEPA] Prompt accepted! Val score: {current_avg:.4f} → {new_avg:.4f}")
+        self.logger.info(f"[GEPA] Improvement margin: {self.improvement_margin:.4f}")
+        self.logger.info(f"[GEPA] Masking negative advantages: {should_mask}")
+
         for i in range(len(results.prompt)):
             results.metrics["gepa_accepted"][i] = 1.0
             results.state[i]["gepa"]["val_score"] = new_avg
@@ -597,6 +601,8 @@ class GepaEnvironment(SingleTurnEnv):
         # In GRPO, advantages are computed as: reward - mean(rewards_in_group)
         # So if reward < mean, the advantage will be negative
         generations = int(self.sampling_args.get("n", 1))
+        masked_count = 0
+
         for start in range(0, len(rewards), generations):
             chunk = rewards[start : start + generations]
             if not chunk:
@@ -609,6 +615,9 @@ class GepaEnvironment(SingleTurnEnv):
                     result.completion_mask[start + i] = [0] * len(
                         result.completion_mask[start + i]
                     )
+                    masked_count += 1
+
+        self.logger.info(f"[GEPA] Masked {masked_count}/{len(rewards)} rollouts with negative advantages")
 
         return result
 
