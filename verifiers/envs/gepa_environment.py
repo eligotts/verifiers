@@ -234,12 +234,22 @@ class GepaEnvironment(SingleTurnEnv):
             **kwargs,
         )
 
+        num_examples = len(results.prompt)
+        empty_feedback = [""] * num_examples
+        preliminary_records = self._build_prompt_eval_records(
+            results=results,
+            feedback=empty_feedback,
+        )
+        reflective_indices = self._select_gepa_examples(preliminary_records)
+
         feedback = await self._generate_feedback_batch(
             client=client,
             system_prompt=system_prompt,
             results=results,
             rewards=results.reward,
+            target_indices=reflective_indices,
         )
+
         for idx, state in enumerate(results.state):
             state.setdefault("gepa", {})
             state["gepa"].update(
@@ -258,11 +268,7 @@ class GepaEnvironment(SingleTurnEnv):
                 }
             )
 
-        batch_records = self._build_prompt_eval_records(
-            results=results,
-            feedback=feedback,
-        )
-        reflective_indices = self._select_gepa_examples(batch_records)
+        batch_records = self._build_prompt_eval_records(results=results, feedback=feedback)
         reflective_dataset = [
             self._build_reflective_example(batch_records[i]) for i in reflective_indices
         ]
@@ -303,15 +309,16 @@ class GepaEnvironment(SingleTurnEnv):
         system_prompt: str,
         results: GenerateOutputs,
         rewards: list[float],
+        target_indices: list[int] | None = None,
     ) -> list[str]:
-        feedback: list[str] = []
-        for prompt, completion, answer, reward in zip(
-            results.prompt,
-            results.completion,
-            results.answer,
-            rewards,
-            strict=False,
-        ):
+        n = len(results.prompt)
+        feedback: list[str] = ["" for _ in range(n)]
+        indices = target_indices if target_indices is not None else list(range(n))
+        for idx in indices:
+            prompt = results.prompt[idx]
+            completion = results.completion[idx]
+            answer = results.answer[idx]
+            reward = rewards[idx]
             user_text = self._extract_user_text(prompt)
             completion_text = self._messages_to_text(completion)
             try:
@@ -350,7 +357,7 @@ class GepaEnvironment(SingleTurnEnv):
             )
             feedback_text = (feedback_text or "").strip()
             self.logger.debug("[GEPA][Feedback response]\n%s", feedback_text)
-            feedback.append(feedback_text)
+            feedback[idx] = feedback_text
         return feedback
 
     def _extract_user_text(self, prompt: Messages) -> str:
