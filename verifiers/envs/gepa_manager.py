@@ -145,6 +145,18 @@ class GepaPromptManager:
         one validation example.
         """
         state = self.state
+        if any(
+            candidate.get("system_prompt") == prompt_text
+            for candidate in state.program_candidates
+        ):
+            return GEPAUpdateResult(
+                accepted=False,
+                parent_idx=parent_idx,
+                candidate_idx=None,
+                evaluation=evaluation,
+                improvements=[False] * len(evaluation.scores),
+            )
+
         total_before = state.total_num_evals
         state.total_num_evals += len(evaluation.scores)
         state.num_full_ds_evals += 1

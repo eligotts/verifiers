@@ -314,17 +314,33 @@ class GepaEnvironment(SingleTurnEnv):
         ):
             user_text = self._extract_user_text(prompt)
             completion_text = self._messages_to_text(completion)
-            formatted = self.feedback_prompt.format(
+            try:
+                instructions = self.feedback_prompt.format(
+                    system_prompt=system_prompt,
+                    user_input=user_text,
+                    model_completion=completion_text,
+                    expected_answer=answer or "",
+                    reward=f"{reward:.4f}",
+                )
+            except KeyError:
+                instructions = self.feedback_prompt
+            feedback_prompt = self._build_feedback_payload(
+                instructions=instructions,
                 system_prompt=system_prompt,
                 user_input=user_text,
-                model_completion=completion_text,
+                completion_text=completion_text,
                 expected_answer=answer or "",
-                reward=f"{reward:.4f}",
+                reward=reward,
             )
+            self.logger.debug(
+                "[GEPA][Feedback payload]\n%s",
+                feedback_prompt,
+            )
+            self.logger.debug("[GEPA][Feedback prompt]\n%s", feedback_prompt)
             response = await self.get_model_response(
                 client=client,
                 model=self.feedback_model,
-                prompt=[{"role": "user", "content": formatted}],
+                prompt=[{"role": "user", "content": feedback_prompt}],
                 sampling_args=dict(self.prompt_optimizer_sampling_args),
                 message_type="chat",
             )
@@ -333,6 +349,7 @@ class GepaEnvironment(SingleTurnEnv):
                 response.choices[0].message.content if response.choices else ""
             )
             feedback_text = (feedback_text or "").strip()
+            self.logger.debug("[GEPA][Feedback response]\n%s", feedback_text)
             feedback.append(feedback_text)
         return feedback
 
@@ -369,6 +386,76 @@ class GepaEnvironment(SingleTurnEnv):
                     texts.append(str(content))
             return "\n".join(texts)
         return str(completion)
+
+    def _prompt_signature(self, prompt: Messages) -> str:
+        if isinstance(prompt, list):
+            parts: list[str] = []
+            for message in prompt:
+                role = message.get("role", "")
+                content = message.get("content", "")
+                if isinstance(content, list):
+                    normalized = "\n".join(
+                        part.get("text", "")
+                        for part in content
+                        if isinstance(part, dict)
+                    )
+                else:
+                    normalized = str(content)
+                parts.append(f"{role}:{normalized}")
+            return "|".join(parts)
+        return str(prompt)
+
+    def _build_feedback_payload(
+        self,
+        *,
+        instructions: str,
+        system_prompt: str,
+        user_input: str,
+        completion_text: str,
+        expected_answer: str,
+        reward: float,
+    ) -> str:
+        context = (
+            "system_prompt: " + (system_prompt or "<empty>") + "\n"
+            "user_input: " + (user_input or "<empty>") + "\n"
+            "assistant_response: " + (completion_text or "<empty>") + "\n"
+            "expected_answer: " + (expected_answer or "<empty>") + "\n"
+            f"reward: {reward:.4f}"
+        )
+        sections = [
+            "Instructions:\n" + instructions.strip(),
+            "Context (analyze all fields before responding):\n```yaml\n"
+            + context
+            + "\n```",
+            "Please provide the requested feedback now.",
+        ]
+        return "\n\n".join(section for section in sections if section)
+
+    def _derive_generation_groups(
+        self,
+        prompts: list[Messages],
+        states: list[State],
+    ) -> list[list[int]]:
+        groups: dict[tuple[str, str, str], list[int]] = {}
+        for idx, (prompt, state) in enumerate(zip(prompts, states, strict=False)):
+            info = state.get("info") or {}
+            group_key: tuple[str, str, str] | None = None
+            if isinstance(info, dict):
+                for candidate in (
+                    "gepa_group_key",
+                    "gepa_example_id",
+                    "example_idx",
+                    "example_id",
+                    "id",
+                    "prompt_id",
+                ):
+                    if candidate in info:
+                        group_key = ("info", candidate, str(info[candidate]))
+                        break
+            if group_key is None:
+                group_key = ("prompt", "signature", self._prompt_signature(prompt))
+            groups.setdefault(group_key, []).append(idx)
+        return list(groups.values())
 
     def _build_prompt_eval_records(
         self,
@@ -600,20 +687,19 @@ class GepaEnvironment(SingleTurnEnv):
         # Compute advantages and mask negative ones
         # In GRPO, advantages are computed as: reward - mean(rewards_in_group)
         # So if reward < mean, the advantage will be negative
-        generations = int(self.sampling_args.get("n", 1))
         masked_count = 0
+        grouping = self._derive_generation_groups(prompts, states)
 
-        for start in range(0, len(rewards), generations):
-            chunk = rewards[start : start + generations]
-            if not chunk:
+        for indices in grouping:
+            if len(indices) <= 1:
                 continue
-            mean = sum(chunk) / len(chunk)
+            group_rewards = [rewards[i] for i in indices]
+            mean_reward = sum(group_rewards) / len(group_rewards)
 
-            for i, reward in enumerate(chunk):
-                if reward < mean:  # This rollout would have negative advantage
-                    # Zero out completion mask for this rollout to prevent weight updates
-                    result.completion_mask[start + i] = [0] * len(
-                        result.completion_mask[start + i]
+            for global_idx in indices:
+                if rewards[global_idx] < mean_reward:  # Negative advantage
+                    result.completion_mask[global_idx] = [0] * len(
+                        result.completion_mask[global_idx]
                     )
                     masked_count += 1
 
