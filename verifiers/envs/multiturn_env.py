@@ -23,10 +23,21 @@ from verifiers.utils.response_utils import (
 logger = logging.getLogger(__name__)
 
 
+class MultiTurnMonitorRubric(vf.Rubric):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.add_metric(self.num_turns)
+
+    async def num_turns(self, state: State) -> int:
+        return len(state["trajectory"])
+
+
 class MultiTurnEnv(vf.Environment):
     def __init__(self, max_turns: int = -1, **kwargs):
         super().__init__(**kwargs)
         self.max_turns = max_turns
+
+        self.add_rubric(MultiTurnMonitorRubric())
 
     @abstractmethod
     async def env_response(
