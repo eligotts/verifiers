@@ -45,6 +45,3 @@ scratch/
 .vscode/
 *.swp
 .DS_Store
-
-# other
-docs/source/old/
