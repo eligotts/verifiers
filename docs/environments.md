@@ -291,6 +291,38 @@ rubric = vf.RubricGroup([math_rubric, judge_rubric])
 
 All rubrics in a group are executed in parallel, and the final reward is the sum of all rubric rewards. Metrics from all rubrics are collected together.
 
+### Metrics and Monitor Rubrics
+
+For simple cases, metrics can be added directly to a rubric via `add_metric()` as shown above. Monitor rubrics extend this pattern by packaging metrics into separate rubrics that are combined via `add_rubric()`. This allows each environment type in a class hierarchy to contribute its own metrics automatically.
+
+Many environment types automatically include a monitor rubric that tracks metrics specific to their level of the environment class hierarchy:
+
+| Environment | Tracked Metrics |
+|-------------|-----------------|
+| `MultiTurnEnv` | `num_turns` |
+| `ToolEnv` | `total_tool_calls`, per-tool counts |
+| `SandboxEnv` | `sandbox_ready_wait_time`, `sandbox_command_execution_time` |
+| `PythonEnv` | `python_ready_wait_time` |
+
+These metrics appear automatically in rollout results alongside any custom reward functions.
+
+To add custom metrics to an environment, define a monitor rubric class and add it via `add_rubric()`:
+
+```python
+class MyMonitorRubric(vf.Rubric):
+    def __init__(self):
+        super().__init__()
+        self.add_metric(self.custom_metric)
+    
+    async def custom_metric(self, state: vf.State) -> float:
+        return len(state["trajectory"])
+
+env = vf.ToolEnv(dataset=dataset, tools=tools, rubric=rubric)
+env.add_rubric(MyMonitorRubric())
+```
+
+The environment automatically wraps rubrics in a `RubricGroup` as needed, so monitor rubrics stack up the class hierarchy—`PythonEnv` inherits metrics from both `SandboxEnv` and `ToolEnv`.
+
 ## Tool Environments
 
 All currently-supported environment types in Verifiers are built on `MultiTurnEnv`, which implements the core single-agent rollout loop (even `SingleTurnEnv` is simply a `MultiTurnEnv` with `max_turns=1` and a placeholder `env_response` method). `ToolEnv` adds tool calling to this foundation.
@@ -339,16 +371,7 @@ vf_env = vf.ToolEnv(
 )
 ```
 
-During rollouts, the model can call tools, receive results, and continue reasoning until it produces a response without tool calls (or hits `max_turns`). Each turn consists of a model response followed by the environment's tool execution.
-
-
-Tool usage can be tracked using the built-in `ToolRubric`, which provides metrics for counting individual and total tool calls, and can be added to a `RubricGroup` to combine with other reward functions:
-
-```python
-main_rubric = vf.Rubric(funcs=[my_correctness_check])   
-tool_rubric = vf.ToolRubric(tools=[calculate, lookup])
-rubric = vf.RubricGroup([main_rubric, tool_rubric])
-```
+During rollouts, the model can call tools, receive results, and continue reasoning until it produces a response without tool calls (or hits `max_turns`). Each turn consists of a model response followed by the environment's tool execution. Tool call counts are tracked automatically via monitor rubrics (see above).
 
 ### MCP Tool Environments
 
