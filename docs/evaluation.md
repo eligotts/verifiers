@@ -1,5 +1,16 @@
 # Evaluation
 
+## Table of Contents
+- [Basic Usage](#basic-usage)
+- [Command Reference](#command-reference)
+  - [Environment Selection](#environment-selection)
+  - [Model Configuration](#model-configuration)
+  - [Sampling Parameters](#sampling-parameters)
+  - [Evaluation Scope](#evaluation-scope)
+  - [Concurrency](#concurrency)
+  - [Output and Saving](#output-and-saving)
+- [Environment Defaults](#environment-defaults)
+
 Use `vf-eval` to execute rollouts against any OpenAI-compatible model and report aggregate metrics.
 
 ## Basic Usage
