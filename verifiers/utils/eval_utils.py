@@ -13,6 +13,7 @@ from datasets.utils import logging as ds_logging
 
 import verifiers as vf
 from verifiers.types import Endpoints, EvalConfig, GenerateMetadata, GenerateOutputs
+from verifiers.utils.async_utils import EventLoopLagMonitor
 from verifiers.utils.client_utils import setup_client
 from verifiers.utils.error_utils import ErrorChain
 from verifiers.utils.logging_utils import print_prompt_completions_sample, print_time
@@ -58,7 +59,11 @@ def load_endpoints(endpoints_path: str):
     return endpoints
 
 
-def print_results(results: GenerateOutputs, num_samples: int = 1):
+def print_results(
+    results: GenerateOutputs,
+    event_loop_lags: list[float] | None = None,
+    num_samples: int = 1,
+):
     assert results["metadata"] is not None
     print("--- Evaluation ---")
     print(f"Environment: {results['metadata']['env_id']}")
@@ -117,7 +122,6 @@ def print_results(results: GenerateOutputs, num_samples: int = 1):
         counter = Counter(error_chains)
         for error_chain, count in counter.items():
             print(f" - {repr(error_chain)}: {count / counter.total():.3f}")
-
     generation_ms_arr = np.array(
         [s["timing"]["generation_ms"] for s in results["state"]]
     )
@@ -136,6 +140,17 @@ def print_results(results: GenerateOutputs, num_samples: int = 1):
     print(
         f"total: min - {print_time(float(np.min(total_arr)))}, mean - {print_time(float(np.mean(total_arr)))}, max - {print_time(float(np.max(total_arr)))}"
     )
+    if event_loop_lags is not None:
+        print("Performance:")
+        event_loop_lags_arr = np.array(event_loop_lags)
+        med_lag, p90_lag, max_lag = (
+            np.median(event_loop_lags_arr),
+            np.percentile(event_loop_lags_arr, 90),
+            np.max(event_loop_lags_arr),
+        )
+        print(
+            f"event_loop_lag: med - {print_time(float(med_lag))}, p90 - {print_time(float(p90_lag))}, max - {print_time(float(max_lag))}"
+        )
 
 
 async def run_evaluation(config: EvalConfig) -> GenerateOutputs:
@@ -149,6 +164,10 @@ async def run_evaluation(config: EvalConfig) -> GenerateOutputs:
 
     # load environment
     vf_env = vf.load_environment(env_id=config.env_id, **config.env_args)
+
+    # load event loop lag monitor
+    event_loop_lag_monitor = EventLoopLagMonitor()
+    event_loop_lag_monitor.run_in_background()
 
     # set extra environment kwargs
     if config.extra_env_kwargs:
@@ -178,8 +197,11 @@ async def run_evaluation(config: EvalConfig) -> GenerateOutputs:
     )
     end_time = time.time()
     logger.info(f"Evaluation completed in {end_time - start_time:.2f} seconds")
+
+    event_loop_lags = event_loop_lag_monitor.get_lags()
+
     if config.print_results:
-        print_results(results)
+        print_results(results, event_loop_lags)
     if config.save_results:
         save_rollout_results(results, config.save_to_hf_hub, config.hf_hub_dataset_name)
     return results
