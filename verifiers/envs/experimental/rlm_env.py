@@ -158,6 +158,67 @@ def update_rlm_metrics_from_step(state: State, step: TrajectoryStep) -> None:
         state["main_rlm_completion_tokens"] += completion_tokens
 
 
+class RLMMonitorRubric(vf.Rubric):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.add_metric(self.sub_llm_call_count)
+        self.add_metric(self.sub_llm_total_turns)
+        self.add_metric(self.sub_llm_prompt_tokens)
+        self.add_metric(self.sub_llm_completion_tokens)
+        self.add_metric(self.sub_llm_total_tool_calls)
+        self.add_metric(self.sub_llm_batch_count)
+        self.add_metric(self.sub_llm_max_batch_size)
+        self.add_metric(self.sub_llm_mean_batch_size)
+        self.add_metric(self.main_rlm_turns)
+        self.add_metric(self.main_rlm_prompt_tokens)
+        self.add_metric(self.main_rlm_completion_tokens)
+        self.add_metric(self.repl_total_time_seconds)
+        self.add_metric(self.repl_call_count)
+        self.add_metric(self.repl_mean_time_seconds)
+
+    async def sub_llm_call_count(self, state: State) -> int:
+        return state["sub_llm_call_count"]
+
+    async def sub_llm_total_turns(self, state: State) -> int:
+        return state["sub_llm_total_turns"]
+
+    async def sub_llm_prompt_tokens(self, state: State) -> int:
+        return state["sub_llm_prompt_tokens"]
+
+    async def sub_llm_completion_tokens(self, state: State) -> int:
+        return state["sub_llm_completion_tokens"]
+
+    async def sub_llm_total_tool_calls(self, state: State) -> int:
+        return state["sub_llm_total_tool_calls"]
+
+    async def sub_llm_batch_count(self, state: State) -> int:
+        return state["sub_llm_batch_count"]
+
+    async def sub_llm_max_batch_size(self, state: State) -> int:
+        return state["sub_llm_max_batch_size"]
+
+    async def sub_llm_mean_batch_size(self, state: State) -> float:
+        return state["sub_llm_mean_batch_size"]
+
+    async def main_rlm_turns(self, state: State) -> int:
+        return state["main_rlm_turns"]
+
+    async def main_rlm_prompt_tokens(self, state: State) -> int:
+        return state["main_rlm_prompt_tokens"]
+
+    async def main_rlm_completion_tokens(self, state: State) -> int:
+        return state["main_rlm_completion_tokens"]
+
+    async def repl_total_time_seconds(self, state: State) -> float:
+        return state["repl_total_time_seconds"]
+
+    async def repl_call_count(self, state: State) -> int:
+        return state["repl_call_count"]
+
+    async def repl_mean_time_seconds(self, state: State) -> float:
+        return state["repl_mean_time_seconds"]
+
+
 class SubLLMTurn(TypedDict):
     """A single turn in a sub-LLM call (used by RLMEnv)."""
 
@@ -646,6 +707,7 @@ class RLMEnv(SandboxEnv):
             rubric=rubric,
             **kwargs,
         )
+        self.add_rubric(RLMMonitorRubric())
 
         # Remove bash tool from parent - we use our own REPL tool
         if hasattr(self, "tool_map") and "bash" in self.tool_map:
