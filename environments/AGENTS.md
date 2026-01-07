@@ -1,4 +1,4 @@
-# Environments
+# environments/AGENTS.md
 
 This section walks through building environments in Verifiers, from simple single-turn tasks to complex multi-turn agents with tools. See [Overview](overview.md) for how to initialize a new environment template.
 

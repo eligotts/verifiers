@@ -28,8 +28,11 @@ __pycache__/
 *.pyd
 *.pyc
 
+# prime
+.prime
+
 # libraries
-prime-rl
+/prime-rl
 
 # outputs
 wandb/
@@ -39,7 +42,6 @@ logs/
 .chroma_db/
 
 # development
-local/
 scratch/
 .idea/
 .vscode/
