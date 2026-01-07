@@ -1629,8 +1629,8 @@ done
         try:
             suffix = f"-{filename}" if filename else ""
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-                tmp_file.write(data)
                 tmp_path = Path(tmp_file.name)
+                tmp_file.write(data)
             await self.with_retry(self.sandbox_client.upload_file)(
                 sandbox_id, file_path, str(tmp_path)
             )
