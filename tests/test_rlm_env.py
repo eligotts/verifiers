@@ -25,6 +25,7 @@ def mock_sandbox_client():
     client.bulk_delete = AsyncMock()
     client.wait_for_creation = AsyncMock()
     client.execute_command = AsyncMock(return_value=MagicMock(stdout="", stderr=""))
+    client.upload_file = AsyncMock()
     client.upload_bytes = AsyncMock()
     return client
 

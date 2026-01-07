@@ -1409,8 +1409,8 @@ done
         payload_bytes = state.get("rlm_payload_bytes")
         payload_path = state.get("rlm_payload_path")
         payload_name = state.get("rlm_payload_name")
-        if payload_bytes is not None and payload_path and payload_name:
-            await self.write_bytes_to_sandbox(
+        if payload_bytes is not None and payload_path:
+            await self.upload_file_to_sandbox(
                 sandbox_id,
                 payload_bytes,
                 payload_path,
@@ -1555,13 +1555,25 @@ done
             sandbox_id, file_path=file_path, file_bytes=data_bytes, filename=filename
         )
 
-    async def write_bytes_to_sandbox(
-        self, sandbox_id: str, data: bytes, file_path: str, filename: str
+    async def upload_file_to_sandbox(
+        self, sandbox_id: str, data: bytes, file_path: str, filename: str | None
     ) -> None:
-        """Write raw bytes to sandbox file using direct file upload."""
-        await self.with_retry(self.sandbox_client.upload_bytes)(
-            sandbox_id, file_path=file_path, file_bytes=data, filename=filename
-        )
+        """Write raw bytes to sandbox file via a temporary file upload."""
+        import tempfile
+        from pathlib import Path
+
+        tmp_path = None
+        try:
+            suffix = f"-{filename}" if filename else ""
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+                tmp_file.write(data)
+                tmp_path = Path(tmp_file.name)
+            await self.with_retry(self.sandbox_client.upload_file)(
+                sandbox_id, file_path, str(tmp_path)
+            )
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
 
     async def _wait_for_worker_ready(self, sandbox_id: str) -> None:
         """Wait for worker to signal ready."""

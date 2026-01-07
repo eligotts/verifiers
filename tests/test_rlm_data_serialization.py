@@ -21,6 +21,7 @@ def test_prepare_text_context_data():
     metadata = prepared.context_dict["input_data_metadata"]
     assert "str" in metadata["type"]
     assert metadata["size"] == 5
+    assert "hash" not in metadata
 
 
 def test_prepare_json_context_data():

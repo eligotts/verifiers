@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -113,19 +112,12 @@ def prepare_context_data(
         serialized.deserializer_function or serializer.deserializer_function
     )
 
-    payload_bytes = None
-    payload_path = None
-    payload_name = None
-    payload_size = None
-    payload_hash = None
-
     payload_bytes = serialized.file_bytes
     payload_name = validate_file_name(
         serialized.file_name or default_payload_file_name(serialized)
     )
     payload_path = f"/tmp/{payload_name}"
     payload_size = len(payload_bytes)
-    payload_hash = hashlib.sha256(payload_bytes).hexdigest()
     ensure_payload_size(payload_size, max_payload_bytes)
 
     metadata = build_metadata(
@@ -133,7 +125,6 @@ def prepare_context_data(
         serialized,
         payload_path=payload_path,
         payload_size=payload_size,
-        payload_hash=payload_hash,
     )
 
     spec = {
@@ -172,7 +163,6 @@ def serialize_text_data(data: Any) -> SerializedData:
 
 
 def serialize_json_data(data: Any) -> SerializedData:
-    validate_json_value(data)
     metadata = build_base_metadata(data)
     payload_text = json.dumps(data, ensure_ascii=True)
     payload_bytes = payload_text.encode("utf-8")
@@ -184,44 +174,6 @@ def serialize_json_data(data: Any) -> SerializedData:
         metadata=metadata,
         format="json",
         encoding="utf-8",
-    )
-
-
-def validate_json_value(
-    value: Any, path: str = "root", seen: set[int] | None = None
-) -> None:
-    if seen is None:
-        seen = set()
-
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return
-
-    if isinstance(value, dict):
-        obj_id = id(value)
-        if obj_id in seen:
-            raise ValueError(f"Cycle detected in JSON data at {path}.")
-        seen.add(obj_id)
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise ValueError(
-                    f"JSON object keys must be strings. Invalid key at {path}."
-                )
-            validate_json_value(item, f"{path}.{key}", seen)
-        seen.remove(obj_id)
-        return
-
-    if isinstance(value, list):
-        obj_id = id(value)
-        if obj_id in seen:
-            raise ValueError(f"Cycle detected in JSON data at {path}.")
-        seen.add(obj_id)
-        for index, item in enumerate(value):
-            validate_json_value(item, f"{path}[{index}]", seen)
-        seen.remove(obj_id)
-        return
-
-    raise ValueError(
-        f"Unsupported type for JSON serialization at {path}: {type(value)}"
     )
 
 
@@ -241,7 +193,6 @@ def build_metadata(
     serialized: SerializedData,
     payload_path: str | None,
     payload_size: int | None,
-    payload_hash: str | None,
 ) -> dict[str, Any]:
     metadata = dict(serialized.metadata)
     metadata.setdefault("type", str(type(data)))
@@ -258,9 +209,6 @@ def build_metadata(
         metadata["path"] = payload_path
     if payload_size is not None:
         metadata["file_size"] = payload_size
-    if payload_hash:
-        metadata["hash"] = payload_hash
-
     return normalize_metadata(metadata)
 
 
