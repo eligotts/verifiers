@@ -463,7 +463,7 @@ class TestSetupState:
         assert "rlm_context" in result
         input_spec = result["rlm_context"]["input_data_spec"]
         assert input_spec is not None
-        assert input_spec["dtype"] == "json"
+        assert input_spec["dtype"] == "builtin"
         assert input_spec["payload_path"] is not None
 
 

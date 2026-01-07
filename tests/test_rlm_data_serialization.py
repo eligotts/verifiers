@@ -8,15 +8,15 @@ from verifiers.utils.rlm_data_serialization_utils import (
 )
 
 
-def test_prepare_text_context_data():
+def test_prepare_builtin_context_data_for_text():
     serializers = build_default_data_serializers()
     prepared = prepare_context_data("hello", None, serializers, max_payload_bytes=1024)
 
     spec = prepared.context_dict["input_data_spec"]
     assert spec is not None
-    assert spec["dtype"] == "text"
+    assert spec["dtype"] == "builtin"
     assert spec["payload_path"] is not None
-    assert prepared.payload_bytes == b"hello"
+    assert prepared.payload_bytes is not None
 
     metadata = prepared.context_dict["input_data_metadata"]
     assert "str" in metadata["type"]
@@ -24,17 +24,17 @@ def test_prepare_text_context_data():
     assert "hash" not in metadata
 
 
-def test_prepare_json_context_data():
+def test_prepare_builtin_context_data_for_dict():
     serializers = build_default_data_serializers()
     prepared = prepare_context_data({"a": 1}, None, serializers, max_payload_bytes=1024)
 
     spec = prepared.context_dict["input_data_spec"]
     assert spec is not None
-    assert spec["dtype"] == "json"
+    assert spec["dtype"] == "builtin"
     assert spec["payload_path"] is not None
 
     metadata = prepared.context_dict["input_data_metadata"]
-    assert metadata["dtype"] == "json"
+    assert metadata["dtype"] == "builtin"
 
 
 def test_prepare_context_data_requires_supported_dtype():
@@ -45,8 +45,8 @@ def test_prepare_context_data_requires_supported_dtype():
 
 def test_prepare_context_data_rejects_unknown_type():
     serializers = build_default_data_serializers()
-    with pytest.raises(ValueError, match="Unsupported data type.*tuple"):
-        prepare_context_data((1, 2), None, serializers, max_payload_bytes=1024)
+    with pytest.raises(ValueError, match="Unsupported data type.*object"):
+        prepare_context_data(object(), None, serializers, max_payload_bytes=1024)
 
 
 def test_prepare_file_payload_with_deserializer():
@@ -100,6 +100,35 @@ def test_prepare_context_data_requires_deserializer_for_custom_dtype():
     )
     with pytest.raises(ValueError, match="requires a deserializer"):
         prepare_context_data(object(), "binary", [serializer], max_payload_bytes=1024)
+
+
+def test_prepare_context_data_accepts_nested_primitives():
+    serializers = build_default_data_serializers()
+    data = {"values": [1, 2, (3, 4)], "flag": True}
+    prepared = prepare_context_data(data, None, serializers, max_payload_bytes=1024)
+    spec = prepared.context_dict["input_data_spec"]
+    assert spec is not None
+    assert spec["dtype"] == "builtin"
+
+
+def test_prepare_context_data_accepts_tuple():
+    serializers = build_default_data_serializers()
+    prepared = prepare_context_data(
+        (1, 2, 3), None, serializers, max_payload_bytes=1024
+    )
+    spec = prepared.context_dict["input_data_spec"]
+    assert spec is not None
+    assert spec["dtype"] == "builtin"
+
+
+def test_prepare_context_data_accepts_bytes():
+    serializers = build_default_data_serializers()
+    prepared = prepare_context_data(
+        b"payload", None, serializers, max_payload_bytes=1024
+    )
+    spec = prepared.context_dict["input_data_spec"]
+    assert spec is not None
+    assert spec["dtype"] == "builtin"
 
 
 def test_payload_size_enforced():

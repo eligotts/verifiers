@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import inspect
 import json
 import textwrap
@@ -107,18 +108,19 @@ def build_default_data_serializers() -> list[DataSerializer]:
 
 def build_default_serializer_registry() -> SerializerRegistry:
     registry = SerializerRegistry()
+    registry.register(build_builtin_serializer())
     registry.register(
         DataSerializer(
             dtype="text",
             serialize=serialize_text_data,
-            can_handle=lambda value: isinstance(value, str),
+            can_handle=None,
         )
     )
     registry.register(
         DataSerializer(
             dtype="json",
             serialize=serialize_json_data,
-            can_handle=lambda value: isinstance(value, (dict, list)),
+            can_handle=None,
         )
     )
     return registry
@@ -325,6 +327,11 @@ def serialize_text_data(data: Any) -> SerializedData:
 
 
 def serialize_json_data(data: Any) -> SerializedData:
+    if not is_json_compatible(data, allow_str=True):
+        raise ValueError(
+            "JSON serializer supports nested Python primitives (dict/list/tuple + "
+            "str/int/float/bool/None)."
+        )
     metadata = build_base_metadata(data)
     payload_text = json.dumps(data, ensure_ascii=True)
     payload_bytes = payload_text.encode("utf-8")
@@ -348,6 +355,172 @@ def build_base_metadata(data: Any) -> dict[str, Any]:
     if size_value is not None:
         metadata["size"] = size_value
     return metadata
+
+
+_BUILTIN_TAG = "__rlm_builtin__"
+
+
+def build_builtin_serializer() -> DataSerializer:
+    def dump_builtin(data: Any) -> bytes:
+        if not is_builtin_data(data):
+            raise ValueError(
+                "Builtin serializer supports Python primitives (None, bool, int, float, str) "
+                "and builtin containers (list, tuple, set, frozenset, dict) plus bytes-like "
+                "types, range, slice, and complex."
+            )
+        encoded = encode_builtin_value(data)
+        return json.dumps(encoded, ensure_ascii=True).encode("utf-8")
+
+    return build_custom_serializer(
+        dtype="builtin",
+        dump=dump_builtin,
+        can_handle=is_builtin_data,
+        file_name="rlm_input_data.json",
+        format="json",
+        encoding="utf-8",
+        deserializer=deserialize_builtin,
+    )
+
+
+def is_builtin_data(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (bool, int, float, str, bytes, bytearray, complex, range)):
+        return True
+    if isinstance(value, slice):
+        return True
+    if isinstance(value, memoryview):
+        return True
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return all(is_builtin_data(item) for item in value)
+    if isinstance(value, dict):
+        return all(is_builtin_data(k) and is_builtin_data(v) for k, v in value.items())
+    return False
+
+
+def encode_builtin_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, bytes):
+        return {
+            _BUILTIN_TAG: "bytes",
+            "data": base64.b64encode(value).decode("ascii"),
+        }
+    if isinstance(value, bytearray):
+        return {
+            _BUILTIN_TAG: "bytearray",
+            "data": base64.b64encode(bytes(value)).decode("ascii"),
+        }
+    if isinstance(value, memoryview):
+        return {
+            _BUILTIN_TAG: "memoryview",
+            "data": base64.b64encode(value.tobytes()).decode("ascii"),
+        }
+    if isinstance(value, complex):
+        return {_BUILTIN_TAG: "complex", "real": value.real, "imag": value.imag}
+    if isinstance(value, range):
+        return {
+            _BUILTIN_TAG: "range",
+            "args": [value.start, value.stop, value.step],
+        }
+    if isinstance(value, slice):
+        return {
+            _BUILTIN_TAG: "slice",
+            "args": [value.start, value.stop, value.step],
+        }
+    if isinstance(value, tuple):
+        return {
+            _BUILTIN_TAG: "tuple",
+            "items": [encode_builtin_value(item) for item in value],
+        }
+    if isinstance(value, set):
+        return {
+            _BUILTIN_TAG: "set",
+            "items": [encode_builtin_value(item) for item in value],
+        }
+    if isinstance(value, frozenset):
+        return {
+            _BUILTIN_TAG: "frozenset",
+            "items": [encode_builtin_value(item) for item in value],
+        }
+    if isinstance(value, list):
+        return [encode_builtin_value(item) for item in value]
+    if isinstance(value, dict):
+        if all(isinstance(key, str) for key in value) and _BUILTIN_TAG not in value:
+            return {key: encode_builtin_value(item) for key, item in value.items()}
+        return {
+            _BUILTIN_TAG: "dict",
+            "items": [
+                [encode_builtin_value(key), encode_builtin_value(item)]
+                for key, item in value.items()
+            ],
+        }
+    raise ValueError(f"Unsupported builtin type: {type(value)}")
+
+
+def deserialize_builtin(payload: Any, spec: dict[str, Any]) -> Any:
+    import base64
+    import json
+
+    builtin_tag = "__rlm_builtin__"
+    if isinstance(payload, bytes):
+        payload = payload.decode("utf-8")
+    data = json.loads(payload)
+
+    def decode(value: Any) -> Any:
+        if isinstance(value, list):
+            return [decode(item) for item in value]
+        if isinstance(value, dict):
+            tag = value.get(builtin_tag)
+            if tag == "bytes":
+                return base64.b64decode(value["data"].encode("ascii"))
+            if tag == "bytearray":
+                return bytearray(base64.b64decode(value["data"].encode("ascii")))
+            if tag == "memoryview":
+                return memoryview(base64.b64decode(value["data"].encode("ascii")))
+            if tag == "complex":
+                return complex(value["real"], value["imag"])
+            if tag == "range":
+                return range(*value["args"])
+            if tag == "slice":
+                return slice(*value["args"])
+            if tag == "tuple":
+                return tuple(decode(item) for item in value["items"])
+            if tag == "set":
+                return set(decode(item) for item in value["items"])
+            if tag == "frozenset":
+                return frozenset(decode(item) for item in value["items"])
+            if tag == "dict":
+                return {
+                    decode(key): decode(item) for key, item in value.get("items", [])
+                }
+            return {key: decode(item) for key, item in value.items()}
+        return value
+
+    return decode(data)
+
+
+def is_json_compatible(value: Any, *, allow_str: bool) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return allow_str
+    if isinstance(value, (bool, int, float)):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(is_json_compatible(item, allow_str=True) for item in value)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not is_json_key(key):
+                return False
+            if not is_json_compatible(item, allow_str=True):
+                return False
+        return True
+    return False
+
+
+def is_json_key(value: Any) -> bool:
+    return value is None or isinstance(value, (str, int, float, bool))
 
 
 def build_metadata(

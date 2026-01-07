@@ -7,7 +7,7 @@ serializers from a single entrypoint:
 
 - `text` → string (default serializer)
 - `json` → dict/list (default serializer)
-- `tuple` → custom serializer/deserializer in this environment
+- `tuple` → builtin serializer (type-preserving without extra deps)
 - `polars` → custom serializer/deserializer in this environment
 
 Run:

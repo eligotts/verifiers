@@ -1,5 +1,4 @@
 import io
-import json
 from typing import Literal
 
 from datasets import Dataset
@@ -15,15 +14,6 @@ from verifiers.utils.rlm_data_serialization_utils import (
 ContextDType = Literal["text", "json", "tuple", "polars"]
 
 
-def deserialize_tuple(payload, spec):
-    import json
-
-    if isinstance(payload, bytes):
-        payload = payload.decode("utf-8")
-    data = json.loads(payload)
-    return tuple(data)
-
-
 def deserialize_polars(payload, spec):
     import io
     import polars as pl
@@ -34,25 +24,6 @@ def deserialize_polars(payload, spec):
         buffer = io.BytesIO(payload)
         return pl.read_parquet(buffer)
     return payload
-
-
-def build_tuple_serializer() -> DataSerializer:
-    def dump_tuple(data):
-        if isinstance(data, list):
-            data = tuple(data)
-        if not isinstance(data, tuple):
-            raise ValueError("Tuple serializer expects a tuple or list input.")
-        return json.dumps(list(data)).encode("utf-8")
-
-    return build_custom_serializer(
-        dtype="tuple",
-        dump=dump_tuple,
-        can_handle=lambda value: isinstance(value, (tuple, list)),
-        file_name="tuple.json",
-        format="json",
-        encoding="utf-8",
-        deserializer=deserialize_tuple,
-    )
 
 
 def build_polars_serializer() -> DataSerializer:
@@ -115,6 +86,7 @@ def _build_dataset(question: str, answer: str) -> Dataset:
 
 def load_environment(context_dtype: ContextDType = "text", **kwargs) -> vf.Environment:
     serializers: list[DataSerializer] = []
+    serializer_dtype = context_dtype
 
     if context_dtype == "text":
         context_data = "Numbers: 1, 2, 3, 4"
@@ -128,7 +100,7 @@ def load_environment(context_dtype: ContextDType = "text", **kwargs) -> vf.Envir
         pip_install_packages = ""
     elif context_dtype == "tuple":
         context_data = (1, 2, 3, 4)
-        serializers.append(build_tuple_serializer())
+        serializer_dtype = "builtin"
         question = "Sum the numbers in extra_data and reply with the integer."
         answer = "10"
         pip_install_packages = ""
@@ -154,7 +126,7 @@ def load_environment(context_dtype: ContextDType = "text", **kwargs) -> vf.Envir
     env = ArbitraryDataRLMEnv(
         dataset=dataset,
         rubric=rubric,
-        context_dtype=context_dtype,
+        context_dtype=serializer_dtype,
         data_serializers=serializers,
         context_data=context_data,
         pip_install_packages=pip_install_packages,
