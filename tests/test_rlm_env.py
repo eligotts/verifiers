@@ -525,7 +525,7 @@ class TestInstallPackages:
 class TestDataSerialization:
     """Tests for prepare_context_data and default serializers."""
 
-    def test_prepare_builtin_context_data_for_text(self):
+    def test_prepare_text_context_data_for_text(self):
         serializers = build_default_data_serializers()
         prepared = prepare_context_data(
             "hello", None, serializers, max_payload_bytes=1024
@@ -533,7 +533,7 @@ class TestDataSerialization:
 
         spec = prepared.context_dict["input_data_spec"]
         assert spec is not None
-        assert spec["dtype"] == "builtin"
+        assert spec["dtype"] == "text"
         assert spec["payload_path"] is not None
         assert prepared.payload_bytes is not None
 
@@ -544,7 +544,9 @@ class TestDataSerialization:
 
     def test_prepare_builtin_context_data_for_dict(self):
         serializers = build_default_data_serializers()
-        prepared = prepare_context_data({"a": 1}, None, serializers, max_payload_bytes=1024)
+        prepared = prepare_context_data(
+            {"a": 1}, None, serializers, max_payload_bytes=1024
+        )
 
         spec = prepared.context_dict["input_data_spec"]
         assert spec is not None
@@ -557,7 +559,9 @@ class TestDataSerialization:
     def test_prepare_context_data_requires_supported_dtype(self):
         serializers = build_default_data_serializers()
         with pytest.raises(ValueError, match="Unsupported dtype.*dict"):
-            prepare_context_data({"a": 1}, "unknown", serializers, max_payload_bytes=1024)
+            prepare_context_data(
+                {"a": 1}, "unknown", serializers, max_payload_bytes=1024
+            )
 
     def test_prepare_context_data_rejects_unknown_type(self):
         serializers = build_default_data_serializers()
@@ -598,7 +602,9 @@ class TestDataSerialization:
             ),
         )
         with pytest.raises(ValueError, match="Inline payloads are not supported"):
-            prepare_context_data(object(), "inline", [serializer], max_payload_bytes=1024)
+            prepare_context_data(
+                object(), "inline", [serializer], max_payload_bytes=1024
+            )
 
     def test_prepare_context_data_requires_deserializer_for_custom_dtype(self):
         serializer = DataSerializer(
@@ -612,7 +618,9 @@ class TestDataSerialization:
             ),
         )
         with pytest.raises(ValueError, match="requires a deserializer"):
-            prepare_context_data(object(), "binary", [serializer], max_payload_bytes=1024)
+            prepare_context_data(
+                object(), "binary", [serializer], max_payload_bytes=1024
+            )
 
     def test_prepare_context_data_accepts_nested_primitives(self):
         serializers = build_default_data_serializers()

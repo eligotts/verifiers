@@ -83,6 +83,11 @@ class SerializerRegistry:
         if dtype:
             return self.get(dtype)
 
+        if isinstance(data, str):
+            serializer = self.serializers_by_dtype.get("text")
+            if serializer is not None:
+                return serializer
+
         matches: list[DataSerializer] = []
         for serializer in self.serializer_order:
             if serializer.can_handle and serializer.can_handle(data):
@@ -221,6 +226,11 @@ def resolve_data_serializer(
             f"Unsupported dtype '{dtype}' for data type {type(data)}. "
             f"Supported dtypes: {supported}. Provide a custom serializer or use a supported dtype."
         )
+
+    if isinstance(data, str):
+        for serializer in serializers:
+            if serializer.dtype == "text":
+                return serializer
 
     matches: list[DataSerializer] = []
     for serializer in serializers:
