@@ -6,8 +6,12 @@ The environment supports multiple `context_dtype` options so you can test differ
 serializers from a single entrypoint:
 
 - `text` → string (default serializer)
-- `json` → dict/list (default serializer)
-- `tuple` → builtin serializer (type-preserving without extra deps)
+- `list` → builtin serializer (random list of ints)
+- `tuple` → builtin serializer (random tuple of ints)
+- `nested_list` → builtin serializer (nested list of ints)
+- `nested_dict` → builtin serializer (nested dict/list of ints)
+- `mixed` → builtin serializer (mixed builtin containers)
+- `large_list` → builtin serializer (larger list of ints)
 - `polars` → custom serializer/deserializer in this environment
 
 Run:

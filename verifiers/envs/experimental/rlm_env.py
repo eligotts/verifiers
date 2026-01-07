@@ -512,8 +512,9 @@ _RLM_START_COMMAND_TEMPLATE = textwrap.dedent(
     ready_flag="{ready_flag}"
     install_done_flag="{install_done_flag}"
     worker_path="{worker_path}"
+    worker_pid_file="{worker_pid_file}"
 
-    rm -f "$command_fifo" "$response_fifo" "$ready_flag" "$install_done_flag"
+    rm -f "$command_fifo" "$response_fifo" "$ready_flag" "$install_done_flag" "$worker_pid_file"
 
     # Write worker script but do NOT start it yet
     # Worker will be started by setup_state after context/env vars are set
@@ -523,9 +524,6 @@ from pathlib import Path
 
 Path("{worker_path}").write_bytes(base64.b64decode("{worker_b64}"))
 PY
-
-    pip install -q requests {pip_install_packages}
-    touch "$install_done_flag"
 
     tail -f /dev/null
     '
@@ -551,6 +549,45 @@ def _make_ready_wait_script(
           sleep 0.05
         done
         echo "{error_message}" >&2
+        exit 1
+        '
+        """
+    )
+
+
+def _make_worker_ready_wait_script(
+    ready_flag: str,
+    pid_file: str,
+    log_file: str,
+    max_wait_seconds: int,
+) -> str:
+    """Wait for worker ready flag or fail fast if the worker process exits."""
+    iterations = max(1, int(max_wait_seconds / 0.1))
+    return textwrap.dedent(
+        f"""
+        bash -lc '
+        for i in $(seq 1 {iterations}); do
+          if [ -f "{ready_flag}" ]; then
+            exit 0
+          fi
+          if [ -f "{pid_file}" ]; then
+            pid=$(cat "{pid_file}" 2>/dev/null || true)
+            if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+              echo "RLM worker exited" >&2
+              if [ -f "{log_file}" ]; then
+                echo "---LOG---" >&2
+                tail -n 200 "{log_file}" >&2
+              fi
+              exit 1
+            fi
+          fi
+          sleep 0.1
+        done
+        echo "RLM worker failed to start" >&2
+        if [ -f "{log_file}" ]; then
+          echo "---LOG---" >&2
+          tail -n 200 "{log_file}" >&2
+        fi
         exit 1
         '
         """
@@ -664,6 +701,7 @@ class RLMEnv(SandboxEnv):
     _RESPONSE_FIFO = "/tmp/rlm_res"
     _READY_FLAG = "/tmp/rlm_ready"
     _INSTALL_DONE_FLAG = "/tmp/rlm_install_done"
+    _WORKER_PID_FILE = "/tmp/rlm_worker.pid"
     _CONTEXT_FILE = "/tmp/rlm_context.json"
     _ANSWER_FILE = "/tmp/rlm_answer.json"
 
@@ -750,6 +788,7 @@ class RLMEnv(SandboxEnv):
             ready_flag=self._READY_FLAG,
             install_done_flag=self._INSTALL_DONE_FLAG,
             worker_path=self._WORKER_PATH,
+            worker_pid_file=self._WORKER_PID_FILE,
             worker_b64=worker_b64,
             pip_install_packages=pip_install_packages,
         )
@@ -1405,6 +1444,7 @@ done
 
         # Start the worker
         nohup python -u {self._WORKER_PATH} >> /tmp/rlm_worker.log 2>&1 &
+        echo $! > {self._WORKER_PID_FILE}
 """
         # Timeout needs to account for pip install wait + worker startup
         start_worker_timeout = self.max_startup_wait_seconds + 30
@@ -1538,13 +1578,20 @@ done
                 await self._prepare_sandbox_and_start_worker(state, context_dict)
                 break  # Success
             except vf.SandboxError as e:
-                if (
-                    "worker failed to start" in str(e.__cause__)
-                    and attempt < max_sandbox_retries - 1
-                ):
+                cause_text = str(e.__cause__ or e)
+                lower_cause = cause_text.lower()
+                retryable = (
+                    isinstance(e, SandboxNotReadyError)
+                    or "worker failed to start" in lower_cause
+                    or "sandbox_not_ready" in lower_cause
+                    or "timeout during sandbox creation" in lower_cause
+                )
+                if retryable and attempt < max_sandbox_retries - 1:
                     logger.warning(
-                        f"Worker startup failed (attempt {attempt + 1}/{max_sandbox_retries}), "
-                        f"recreating sandbox..."
+                        "Sandbox startup failed (attempt %s/%s): %s. Recreating sandbox...",
+                        attempt + 1,
+                        max_sandbox_retries,
+                        cause_text,
                     )
                     state = await self._recreate_sandbox(state)
                 else:
@@ -1593,23 +1640,29 @@ done
 
     async def _wait_for_worker_ready(self, sandbox_id: str) -> None:
         """Wait for worker to signal ready."""
-        wait_script = _make_ready_wait_script(
+        wait_script = _make_worker_ready_wait_script(
             self._READY_FLAG,
+            self._WORKER_PID_FILE,
+            "/tmp/rlm_worker.log",
             self.max_startup_wait_seconds,
-            error_message="RLM worker failed to start",
         )
         # Use max_startup_wait_seconds as timeout (+ buffer for script overhead)
         timeout = self.max_startup_wait_seconds + 10
         result = await self._execute_command_with_retry(
             sandbox_id, wait_script, timeout=timeout
         )
-        if "failed to start" in result.stdout or "failed to start" in (
-            result.stderr or ""
+        stderr = result.stderr or ""
+        stdout = result.stdout or ""
+        if (
+            "RLM worker failed to start" in stdout
+            or "RLM worker failed to start" in stderr
+            or "RLM worker exited" in stdout
+            or "RLM worker exited" in stderr
         ):
             # Debug: get more info about why it failed
             debug_result = await self._execute_command_with_retry(
                 sandbox_id,
-                "ls -la /tmp/rlm* 2>&1; echo '---LOG---'; cat /tmp/rlm_worker.log 2>&1 || echo 'no log'; echo '---PS---'; ps aux 2>&1",
+                "ls -la /tmp/rlm* 2>&1; echo '---PID---'; cat /tmp/rlm_worker.pid 2>&1 || echo 'no pid'; echo '---LOG---'; cat /tmp/rlm_worker.log 2>&1 || echo 'no log'; echo '---PS---'; ps aux 2>&1",
             )
             logger.error(
                 f"RLM worker failed to start. Debug info:\n{debug_result.stdout}"
@@ -1619,22 +1672,42 @@ done
             )
 
     async def _wait_for_install_done(self, sandbox_id: str) -> None:
-        """Wait for pip installs to finish before starting the worker."""
+        """Install required packages inside the sandbox before starting the worker."""
         install_wait_seconds = self._compute_install_wait_seconds()
-        wait_script = _make_ready_wait_script(
-            self._INSTALL_DONE_FLAG,
-            install_wait_seconds,
-            error_message="RLM pip install did not complete",
-        )
+        packages = ["requests"]
+        extra_packages = [
+            p.strip() for p in self.pip_install_packages.split() if p.strip()
+        ]
+        packages.extend(extra_packages)
+        if not packages:
+            return
+        install_cmd = " ".join(packages)
         timeout = install_wait_seconds + 10
-        result = await self._execute_command_with_retry(
-            sandbox_id, wait_script, timeout=timeout
+        install_script = textwrap.dedent(
+            f"""
+            bash -lc '
+            set -euo pipefail
+            rm -f "{self._INSTALL_DONE_FLAG}"
+            pip install -q {install_cmd} 2>&1 | tee /tmp/rlm_pip.log
+            touch "{self._INSTALL_DONE_FLAG}"
+            '
+            """
         )
-        if (
-            "pip install did not complete" in result.stdout
-            or "pip install did not complete" in (result.stderr or "")
-        ):
-            raise vf.SandboxError() from Exception("RLM pip install did not complete")
+        result = await self._execute_command_with_retry(
+            sandbox_id, install_script, timeout=timeout
+        )
+        exit_code = getattr(result, "exit_code", 0)
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0:
+            debug_result = await self._execute_command_with_retry(
+                sandbox_id,
+                "echo '---PIP LOG---'; tail -n 200 /tmp/rlm_pip.log 2>&1 || echo 'no pip log'",
+            )
+            logger.error(
+                "RLM pip install failed (exit_code=%s). Log tail:\n%s",
+                exit_code,
+                debug_result.stdout,
+            )
+            raise vf.SandboxError() from Exception("RLM pip install failed")
 
     # =========================================================================
     # Code Execution

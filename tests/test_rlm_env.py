@@ -7,6 +7,7 @@ import pytest
 from datasets import Dataset
 from prime_sandboxes import CommandTimeoutError
 
+import verifiers as vf
 from verifiers.envs.experimental import rlm_env as rlm_module
 from verifiers.envs.experimental.rlm_env import RLMEnv
 
@@ -465,6 +466,49 @@ class TestSetupState:
         assert input_spec is not None
         assert input_spec["dtype"] == "builtin"
         assert input_spec["payload_path"] is not None
+
+
+class TestInstallPackages:
+    """Tests for sandbox package installation behavior."""
+
+    @pytest.mark.asyncio
+    async def test_wait_for_install_done_ignores_non_int_exit_code(self, rlm_env):
+        """Non-int exit_code from mocks should not raise."""
+        rlm_env._execute_command_with_retry = AsyncMock(
+            return_value=MagicMock(exit_code=MagicMock(), stdout="", stderr="")
+        )
+
+        await rlm_env._wait_for_install_done("sandbox_123")
+
+        rlm_env._execute_command_with_retry.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_wait_for_install_done_raises_on_nonzero_exit_code(self, rlm_env):
+        """Non-zero integer exit_code should raise SandboxError."""
+        rlm_env._execute_command_with_retry = AsyncMock(
+            side_effect=[
+                MagicMock(exit_code=1, stdout="", stderr=""),
+                MagicMock(stdout="log", stderr=""),
+            ]
+        )
+
+        with pytest.raises(vf.SandboxError):
+            await rlm_env._wait_for_install_done("sandbox_123")
+
+        assert rlm_env._execute_command_with_retry.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_wait_for_install_done_includes_requests_and_extras(self, rlm_env):
+        """Install command should include requests plus extra packages."""
+        rlm_env.pip_install_packages = "polars>=0.20.0 numpy"
+        rlm_env._execute_command_with_retry = AsyncMock(
+            return_value=MagicMock(exit_code=0, stdout="", stderr="")
+        )
+
+        await rlm_env._wait_for_install_done("sandbox_123")
+
+        install_script = rlm_env._execute_command_with_retry.call_args.args[1]
+        assert "pip install -q requests polars>=0.20.0 numpy" in install_script
 
 
 class TestCleanupRLMState:

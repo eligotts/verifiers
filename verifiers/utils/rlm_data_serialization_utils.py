@@ -143,7 +143,9 @@ def build_deserializer_spec(
             raise ValueError(
                 "Unable to extract deserializer source; pass deserializer_code instead."
             ) from exc
-        return textwrap.dedent(source), deserializer.__name__
+        source = textwrap.dedent(source)
+        source = "from __future__ import annotations\n\n" + source
+        return source, deserializer.__name__
     if (deserializer_code is None) != (deserializer_function is None):
         raise ValueError("Provide both deserializer_code and deserializer_function.")
     return deserializer_code, deserializer_function
