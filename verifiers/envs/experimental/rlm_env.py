@@ -1697,7 +1697,11 @@ done
             sandbox_id, install_script, timeout=timeout
         )
         exit_code = getattr(result, "exit_code", 0)
-        if isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0:
+        if (
+            isinstance(exit_code, int)
+            and not isinstance(exit_code, bool)
+            and exit_code != 0
+        ):
             debug_result = await self._execute_command_with_retry(
                 sandbox_id,
                 "echo '---PIP LOG---'; tail -n 200 /tmp/rlm_pip.log 2>&1 || echo 'no pip log'",
