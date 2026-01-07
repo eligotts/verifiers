@@ -7,83 +7,71 @@ from datasets import Dataset
 import verifiers as vf
 from verifiers.envs.experimental.rlm_env import RLMEnv
 from verifiers.types import State
-from verifiers.utils.rlm_data_serialization_utils import DataSerializer, SerializedData
+from verifiers.utils.rlm_data_serialization_utils import (
+    DataSerializer,
+    build_custom_serializer,
+)
 
 ContextDType = Literal["text", "json", "tuple", "polars"]
 
-_TUPLE_DESERIALIZER = """
-import json
 
 def deserialize_tuple(payload, spec):
+    import json
+
     if isinstance(payload, bytes):
         payload = payload.decode("utf-8")
     data = json.loads(payload)
     return tuple(data)
-"""
 
-_POLARS_DESERIALIZER = """
-import io
-import polars as pl
 
 def deserialize_polars(payload, spec):
+    import io
+    import polars as pl
+
     if isinstance(payload, str):
         payload = payload.encode("utf-8")
     if isinstance(payload, bytes):
         buffer = io.BytesIO(payload)
         return pl.read_parquet(buffer)
     return payload
-"""
 
 
 def build_tuple_serializer() -> DataSerializer:
-    def serialize_tuple(data):
+    def dump_tuple(data):
         if isinstance(data, list):
             data = tuple(data)
         if not isinstance(data, tuple):
             raise ValueError("Tuple serializer expects a tuple or list input.")
-        payload = json.dumps(list(data)).encode("utf-8")
-        return SerializedData(
-            dtype="tuple",
-            inline_data=None,
-            file_bytes=payload,
-            file_name="tuple.json",
-            metadata={},
-            format="json",
-            encoding="utf-8",
-            deserializer_code=_TUPLE_DESERIALIZER,
-            deserializer_function="deserialize_tuple",
-        )
+        return json.dumps(list(data)).encode("utf-8")
 
-    return DataSerializer(
+    return build_custom_serializer(
         dtype="tuple",
-        serialize=serialize_tuple,
+        dump=dump_tuple,
         can_handle=lambda value: isinstance(value, (tuple, list)),
+        file_name="tuple.json",
+        format="json",
+        encoding="utf-8",
+        deserializer=deserialize_tuple,
     )
 
 
 def build_polars_serializer() -> DataSerializer:
     import polars as pl
 
-    def serialize_polars(data):
+    def dump_polars(data):
         if not isinstance(data, pl.DataFrame):
             raise ValueError("Polars serializer expects a polars.DataFrame input.")
         buffer = io.BytesIO()
         data.write_parquet(buffer)
-        return SerializedData(
-            dtype="polars",
-            inline_data=None,
-            file_bytes=buffer.getvalue(),
-            file_name="dataframe.parquet",
-            metadata={},
-            format="parquet",
-            deserializer_code=_POLARS_DESERIALIZER,
-            deserializer_function="deserialize_polars",
-        )
+        return buffer.getvalue()
 
-    return DataSerializer(
+    return build_custom_serializer(
         dtype="polars",
-        serialize=serialize_polars,
+        dump=dump_polars,
         can_handle=lambda value: isinstance(value, pl.DataFrame),
+        file_name="dataframe.parquet",
+        format="parquet",
+        deserializer=deserialize_polars,
     )
 
 

@@ -56,7 +56,8 @@ from verifiers.utils.response_utils import (
 )
 from verifiers.utils.rlm_data_serialization_utils import (
     DataSerializer,
-    build_default_data_serializers,
+    SerializerRegistry,
+    build_default_serializer_registry,
     prepare_context_data,
 )
 from verifiers.utils.tool_utils import convert_func_to_oai_tool
@@ -632,6 +633,10 @@ class RLMEnv(SandboxEnv):
         context_dtype: Optional dtype override for input data serialization.
                    If set, must match a supported serializer dtype.
         data_serializers: Optional list of custom serializers provided by the designer.
+                   These are registered on top of the default registry (text/json),
+                   overriding by dtype if there are conflicts.
+        serializer_registry: Optional explicit serializer registry. If provided,
+                   data_serializers must be None and this registry is used as-is.
         system_prompt: Custom system prompt (default: RLM standard prompt)
         interception_host: Optional hostname/IP for interception server (auto-tunneled if not set)
         interception_port: Port for interception server (default: 8766)
@@ -673,6 +678,7 @@ class RLMEnv(SandboxEnv):
         context_key: str = "context",
         context_dtype: str | None = None,
         data_serializers: list[DataSerializer] | None = None,
+        serializer_registry: SerializerRegistry | None = None,
         system_prompt: str | None = None,
         interception_host: str | None = None,
         interception_port: int = 8766,
@@ -693,8 +699,18 @@ class RLMEnv(SandboxEnv):
         self.max_sub_llm_parallelism = max_sub_llm_parallelism
         self.context_key = context_key
         self.context_dtype = context_dtype
-        custom_serializers = data_serializers or []
-        self.data_serializers = custom_serializers + build_default_data_serializers()
+        if serializer_registry is not None and data_serializers is not None:
+            raise ValueError(
+                "Provide either serializer_registry or data_serializers, not both."
+            )
+        if serializer_registry is not None:
+            self.serializer_registry = serializer_registry
+        else:
+            registry = build_default_serializer_registry()
+            for serializer in data_serializers or []:
+                registry.register(serializer, allow_override=True)
+            self.serializer_registry = registry
+        self.data_serializers = self.serializer_registry.all()
         self.custom_system_prompt = system_prompt
         self.interception_host = interception_host
         self.interception_port = interception_port
@@ -1487,7 +1503,7 @@ done
         prepared_context = prepare_context_data(
             context_data,
             self.context_dtype,
-            self.data_serializers,
+            self.serializer_registry,
             max_payload_bytes,
         )
         context_dict = prepared_context.context_dict

@@ -87,6 +87,21 @@ def test_inline_payload_rejected():
         prepare_context_data(object(), "inline", [serializer], max_payload_bytes=1024)
 
 
+def test_prepare_context_data_requires_deserializer_for_custom_dtype():
+    serializer = DataSerializer(
+        dtype="binary",
+        serialize=lambda data: SerializedData(
+            dtype="binary",
+            inline_data=None,
+            file_bytes=b"payload",
+            file_name="payload.bin",
+            metadata={"type": "binary"},
+        ),
+    )
+    with pytest.raises(ValueError, match="requires a deserializer"):
+        prepare_context_data(object(), "binary", [serializer], max_payload_bytes=1024)
+
+
 def test_payload_size_enforced():
     serializers = build_default_data_serializers()
     with pytest.raises(ValueError, match="Payload exceeds sandbox storage limit"):

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import inspect
 import json
+import textwrap
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -35,24 +37,177 @@ class PreparedContextData:
     payload_name: str | None
 
 
+class SerializerRegistry:
+    def __init__(self, serializers: list[DataSerializer] | None = None) -> None:
+        self.serializers_by_dtype: dict[str, DataSerializer] = {}
+        self.serializer_order: list[DataSerializer] = []
+        if serializers:
+            for serializer in serializers:
+                self.register(serializer)
+
+    def register(
+        self, serializer: DataSerializer, allow_override: bool = False
+    ) -> None:
+        existing = self.serializers_by_dtype.get(serializer.dtype)
+        if existing and not allow_override:
+            raise ValueError(
+                f"Serializer for dtype '{serializer.dtype}' already registered. "
+                "Use allow_override=True to replace it."
+            )
+        if existing:
+            for index, item in enumerate(self.serializer_order):
+                if item.dtype == serializer.dtype:
+                    self.serializer_order[index] = serializer
+                    break
+        else:
+            self.serializer_order.append(serializer)
+        self.serializers_by_dtype[serializer.dtype] = serializer
+
+    def get(self, dtype: str) -> DataSerializer:
+        serializer = self.serializers_by_dtype.get(dtype)
+        if serializer is None:
+            supported = ", ".join(sorted(self.serializers_by_dtype))
+            raise ValueError(
+                f"Unsupported dtype '{dtype}'. Supported dtypes: {supported}."
+            )
+        return serializer
+
+    def list_dtypes(self) -> list[str]:
+        return list(self.serializers_by_dtype.keys())
+
+    def all(self) -> list[DataSerializer]:
+        return list(self.serializer_order)
+
+    def resolve(self, data: Any, dtype: str | None) -> DataSerializer:
+        if dtype:
+            return self.get(dtype)
+
+        matches: list[DataSerializer] = []
+        for serializer in self.serializer_order:
+            if serializer.can_handle and serializer.can_handle(data):
+                matches.append(serializer)
+
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            matched = ", ".join(sorted({s.dtype for s in matches}))
+            raise ValueError(
+                f"Ambiguous data type {type(data)} matched multiple serializers: {matched}. "
+                "Specify dtype or provide a custom serializer."
+            )
+
+        raise ValueError(
+            f"Unsupported data type {type(data)}. Specify dtype or provide a custom serializer."
+        )
+
+
 def build_default_data_serializers() -> list[DataSerializer]:
-    return [
+    return build_default_serializer_registry().all()
+
+
+def build_default_serializer_registry() -> SerializerRegistry:
+    registry = SerializerRegistry()
+    registry.register(
         DataSerializer(
             dtype="text",
             serialize=serialize_text_data,
             can_handle=lambda value: isinstance(value, str),
-        ),
+        )
+    )
+    registry.register(
         DataSerializer(
             dtype="json",
             serialize=serialize_json_data,
             can_handle=lambda value: isinstance(value, (dict, list)),
-        ),
-    ]
+        )
+    )
+    return registry
+
+
+def build_deserializer_spec(
+    deserializer: Callable[[Any, dict[str, Any]], Any] | None,
+    deserializer_code: str | None,
+    deserializer_function: str | None,
+) -> tuple[str | None, str | None]:
+    if deserializer is not None and (deserializer_code or deserializer_function):
+        raise ValueError(
+            "Provide either a deserializer callable or "
+            "deserializer_code/deserializer_function, not both."
+        )
+    if deserializer is not None:
+        try:
+            source = inspect.getsource(deserializer)
+        except OSError as exc:
+            raise ValueError(
+                "Unable to extract deserializer source; pass deserializer_code instead."
+            ) from exc
+        return textwrap.dedent(source), deserializer.__name__
+    if (deserializer_code is None) != (deserializer_function is None):
+        raise ValueError("Provide both deserializer_code and deserializer_function.")
+    return deserializer_code, deserializer_function
+
+
+def build_custom_serializer(
+    dtype: str,
+    dump: Callable[[Any], bytes | str],
+    *,
+    can_handle: Callable[[Any], bool] | None = None,
+    file_name: str | None = None,
+    format: str | None = None,
+    encoding: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    deserializer: Callable[[Any, dict[str, Any]], Any] | None = None,
+    deserializer_code: str | None = None,
+    deserializer_function: str | None = None,
+) -> DataSerializer:
+    deserializer_spec = build_deserializer_spec(
+        deserializer, deserializer_code, deserializer_function
+    )
+
+    def serialize(data: Any) -> SerializedData:
+        payload = dump(data)
+        if isinstance(payload, str):
+            payload_bytes = payload.encode(encoding or "utf-8")
+        elif isinstance(payload, bytes):
+            payload_bytes = payload
+        else:
+            raise ValueError(
+                f"Serializer dump must return bytes or str, got {type(payload)}."
+            )
+
+        data_metadata = build_base_metadata(data)
+        if metadata:
+            data_metadata.update(metadata)
+
+        return SerializedData(
+            dtype=dtype,
+            inline_data=None,
+            file_bytes=payload_bytes,
+            file_name=file_name,
+            metadata=data_metadata,
+            format=format,
+            encoding=encoding,
+            deserializer_code=deserializer_spec[0],
+            deserializer_function=deserializer_spec[1],
+        )
+
+    return DataSerializer(
+        dtype=dtype,
+        serialize=serialize,
+        can_handle=can_handle,
+        deserializer_code=deserializer_spec[0],
+        deserializer_function=deserializer_spec[1],
+    )
 
 
 def resolve_data_serializer(
-    data: Any, dtype: str | None, serializers: list[DataSerializer]
+    data: Any,
+    dtype: str | None,
+    serializers: SerializerRegistry | list[DataSerializer],
 ) -> DataSerializer:
+    if isinstance(serializers, SerializerRegistry):
+        return serializers.resolve(data, dtype)
+
     if dtype:
         for serializer in serializers:
             if serializer.dtype == dtype:
@@ -86,7 +241,7 @@ def resolve_data_serializer(
 def prepare_context_data(
     data: Any,
     dtype: str | None,
-    serializers: list[DataSerializer],
+    serializers: SerializerRegistry | list[DataSerializer],
     max_payload_bytes: int | None,
 ) -> PreparedContextData:
     if data is None:
@@ -111,6 +266,13 @@ def prepare_context_data(
     deserializer_function = (
         serialized.deserializer_function or serializer.deserializer_function
     )
+    if serialized.dtype not in {"text", "json"} and not (
+        deserializer_code and deserializer_function
+    ):
+        raise ValueError(
+            f"Custom dtype '{serialized.dtype}' requires a deserializer. "
+            "Provide deserializer_code and deserializer_function."
+        )
 
     payload_bytes = serialized.file_bytes
     payload_name = validate_file_name(
