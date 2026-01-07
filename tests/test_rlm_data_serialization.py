@@ -1,6 +1,6 @@
 import pytest
 
-from verifiers.utils.rlm_data_serialization import (
+from verifiers.utils.rlm_data_serialization_utils import (
     build_default_data_serializers,
     prepare_context_data,
 )
