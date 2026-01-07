@@ -58,16 +58,29 @@ def resolve_data_serializer(
         for serializer in serializers:
             if serializer.dtype == dtype:
                 return serializer
+        supported = ", ".join(sorted({s.dtype for s in serializers}))
         raise ValueError(
-            f"Unsupported dtype '{dtype}'. Provide a custom serializer or use a supported dtype."
+            f"Unsupported dtype '{dtype}' for data type {type(data)}. "
+            f"Supported dtypes: {supported}. Provide a custom serializer or use a supported dtype."
         )
 
+    matches: list[DataSerializer] = []
     for serializer in serializers:
         if serializer.can_handle and serializer.can_handle(data):
-            return serializer
+            matches.append(serializer)
+
+    if len(matches) == 1:
+        return matches[0]
+
+    if len(matches) > 1:
+        matched = ", ".join(sorted({s.dtype for s in matches}))
+        raise ValueError(
+            f"Ambiguous data type {type(data)} matched multiple serializers: {matched}. "
+            "Specify dtype or provide a custom serializer."
+        )
 
     raise ValueError(
-        "Unsupported data type. Specify dtype or provide a custom serializer."
+        f"Unsupported data type {type(data)}. Specify dtype or provide a custom serializer."
     )
 
 
@@ -117,7 +130,13 @@ def prepare_context_data(
         ensure_payload_size(payload_size, max_payload_bytes)
     else:
         inline_data = serialized.inline_data
-        inline_bytes = json.dumps(inline_data).encode("utf-8")
+        try:
+            inline_bytes = json.dumps(inline_data).encode("utf-8")
+        except TypeError as exc:
+            raise ValueError(
+                "Inline payload must be JSON-serializable. "
+                "Provide file bytes or a custom serializer."
+            ) from exc
         inline_size = len(inline_bytes)
         ensure_payload_size(inline_size, max_payload_bytes)
 
