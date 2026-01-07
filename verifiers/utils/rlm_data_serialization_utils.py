@@ -150,7 +150,12 @@ def build_deserializer_spec(
             ) from exc
         source = textwrap.dedent(source)
         source = "from __future__ import annotations\n\n" + source
-        return source, deserializer.__name__
+        name = getattr(deserializer, "__name__", None)
+        if not name:
+            raise ValueError(
+                "Deserializer must be a named function; pass deserializer_code instead."
+            )
+        return source, name
     if (deserializer_code is None) != (deserializer_function is None):
         raise ValueError("Provide both deserializer_code and deserializer_function.")
     return deserializer_code, deserializer_function
