@@ -25,6 +25,7 @@ def mock_sandbox_client():
     client.bulk_delete = AsyncMock()
     client.wait_for_creation = AsyncMock()
     client.execute_command = AsyncMock(return_value=MagicMock(stdout="", stderr=""))
+    client.upload_bytes = AsyncMock()
     return client
 
 
@@ -252,7 +253,7 @@ async def test_execute_code_timeout_restarts_sandbox(rlm_env):
 
     state = {
         "sandbox_id": "sandbox_123",
-        "rlm_context": {"input_data": None, "input_data_metadata": {}},
+        "rlm_context": {"input_data_spec": None, "input_data_metadata": {}},
     }
     result = await rlm_env._execute_code("sandbox_123", "print(1)", state)
 
@@ -459,7 +460,10 @@ class TestSetupState:
         result = await rlm_env.setup_state(state)
 
         assert "rlm_context" in result
-        assert result["rlm_context"]["input_data"] == context_data
+        input_spec = result["rlm_context"]["input_data_spec"]
+        assert input_spec is not None
+        assert input_spec["dtype"] == "json"
+        assert input_spec["payload_path"] is not None
 
 
 class TestCleanupRLMState:

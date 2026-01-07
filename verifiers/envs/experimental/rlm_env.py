@@ -54,6 +54,11 @@ from verifiers.utils.response_utils import (
     parse_response_messages,
     parse_response_tokens,
 )
+from verifiers.utils.rlm_data_serialization_utils import (
+    DataSerializer,
+    build_default_data_serializers,
+    prepare_context_data,
+)
 from verifiers.utils.tool_utils import convert_func_to_oai_tool
 from verifiers.utils.tunnel_utils import TunnelPool
 
@@ -282,7 +287,51 @@ _RLM_WORKER_SCRIPT = textwrap.dedent(
     if Path(CONTEXT_FILE).exists():
         with open(CONTEXT_FILE, "r", encoding="utf-8") as f:
             _full_context = json.load(f)
-            extra_data = _full_context.get("input_data")
+            data_spec = _full_context.get("input_data_spec") or {{}}
+            if data_spec:
+                payload_inline = data_spec.get("payload_inline")
+                payload_path = data_spec.get("payload_path")
+                payload_encoding = data_spec.get("payload_encoding")
+                payload = None
+                if payload_inline is not None:
+                    payload = payload_inline
+                elif payload_path:
+                    if payload_encoding:
+                        with open(payload_path, "r", encoding=payload_encoding) as pf:
+                            payload = pf.read()
+                    else:
+                        with open(payload_path, "rb") as pf:
+                            payload = pf.read()
+
+                dtype = data_spec.get("dtype", "")
+                deserializer_code = data_spec.get("deserializer_code")
+                deserializer_function = data_spec.get("deserializer_function")
+
+                if deserializer_code and deserializer_function:
+                    namespace = {{}}
+                    exec(deserializer_code, namespace)
+                    if deserializer_function not in namespace:
+                        raise ValueError(
+                            "Deserializer function '"
+                            + str(deserializer_function)
+                            + "' not found"
+                        )
+                    extra_data = namespace[deserializer_function](payload, data_spec)
+                elif dtype == "text":
+                    extra_data = payload
+                elif dtype == "json":
+                    if isinstance(payload, bytes):
+                        payload = payload.decode("utf-8")
+                    if isinstance(payload, str):
+                        extra_data = json.loads(payload)
+                    else:
+                        extra_data = payload
+                else:
+                    raise ValueError(
+                        "No deserializer provided for dtype '" + str(dtype) + "'."
+                    )
+            else:
+                extra_data = _full_context.get("input_data")
 
     # Initialize answer structure
     answer = {{"ready": False, "content": ""}}
@@ -582,6 +631,9 @@ class RLMEnv(SandboxEnv):
         max_output_length: Maximum length of code execution output
         max_sub_llm_parallelism: Maximum number of concurrent sub-LLM calls
         context_key: Key in info containing optional input data (default: "context")
+        context_dtype: Optional dtype override for input data serialization.
+                   If set, must match a supported serializer dtype.
+        data_serializers: Optional list of custom serializers provided by the designer.
         system_prompt: Custom system prompt (default: RLM standard prompt)
         interception_host: Optional hostname/IP for interception server (auto-tunneled if not set)
         interception_port: Port for interception server (default: 8766)
@@ -621,6 +673,8 @@ class RLMEnv(SandboxEnv):
         max_output_length: int = 8192,
         max_sub_llm_parallelism: int = 5,
         context_key: str = "context",
+        context_dtype: str | None = None,
+        data_serializers: list[DataSerializer] | None = None,
         system_prompt: str | None = None,
         interception_host: str | None = None,
         interception_port: int = 8766,
@@ -640,6 +694,9 @@ class RLMEnv(SandboxEnv):
         self.max_output_length = max_output_length
         self.max_sub_llm_parallelism = max_sub_llm_parallelism
         self.context_key = context_key
+        self.context_dtype = context_dtype
+        custom_serializers = data_serializers or []
+        self.data_serializers = custom_serializers + build_default_data_serializers()
         self.custom_system_prompt = system_prompt
         self.interception_host = interception_host
         self.interception_port = interception_port
@@ -1351,6 +1408,16 @@ done
             await self.sandbox_client.wait_for_creation(sandbox_id)
         except Exception as e:
             raise SandboxNotReadyError(e)
+        payload_bytes = state.get("rlm_payload_bytes")
+        payload_path = state.get("rlm_payload_path")
+        payload_name = state.get("rlm_payload_name")
+        if payload_bytes is not None and payload_path and payload_name:
+            await self.write_bytes_to_sandbox(
+                sandbox_id,
+                payload_bytes,
+                payload_path,
+                payload_name,
+            )
         await self._write_json_to_sandbox(
             sandbox_id, context_dict, self._CONTEXT_FILE, "rlm_context.json"
         )
@@ -1414,16 +1481,24 @@ done
         # 5. Build context
         info = state.get("info", {})
         context_data = info.get(self.context_key, None)
-        metadata: dict[str, str | int] = {"type": str(type(context_data))}
-        if context_data is None:
-            metadata["size"] = 0
-        elif hasattr(context_data, "__len__"):
-            metadata["size"] = len(context_data)
-        else:
-            metadata["size"] = "unknown"
-        context_dict = {"input_data": context_data, "input_data_metadata": metadata}
-        state["rlm_context"] = context_dict
+        disk_size_gb = getattr(self.sandbox_request, "disk_size_gb", None)
+        max_payload_bytes = None
+        if isinstance(disk_size_gb, (int, float)) and disk_size_gb > 0:
+            max_payload_bytes = int(disk_size_gb * 1024**3)
 
+        prepared_context = prepare_context_data(
+            context_data,
+            self.context_dtype,
+            self.data_serializers,
+            max_payload_bytes,
+        )
+        context_dict = prepared_context.context_dict
+        state["rlm_context"] = context_dict
+        state["rlm_payload_bytes"] = prepared_context.payload_bytes
+        state["rlm_payload_path"] = prepared_context.payload_path
+        state["rlm_payload_name"] = prepared_context.payload_name
+
+        metadata = context_dict.get("input_data_metadata", {})
         metadata_summary = self._generate_metadata_documentation(metadata)
         base_system_prompt = self.custom_system_prompt or _RLM_SYSTEM_PROMPT
         if "{metadata_summary}" in base_system_prompt:
@@ -1480,6 +1555,14 @@ done
         data_bytes = json.dumps(data).encode("utf-8")
         await self.with_retry(self.sandbox_client.upload_bytes)(
             sandbox_id, file_path=file_path, file_bytes=data_bytes, filename=filename
+        )
+
+    async def write_bytes_to_sandbox(
+        self, sandbox_id: str, data: bytes, file_path: str, filename: str
+    ) -> None:
+        """Write raw bytes to sandbox file using direct file upload."""
+        await self.with_retry(self.sandbox_client.upload_bytes)(
+            sandbox_id, file_path=file_path, file_bytes=data, filename=filename
         )
 
     async def _wait_for_worker_ready(self, sandbox_id: str) -> None:
