@@ -48,41 +48,41 @@ def test_prepare_context_data_rejects_unknown_type():
         prepare_context_data((1, 2), None, serializers, max_payload_bytes=1024)
 
 
-def test_prepare_inline_payload_with_deserializer():
+def test_prepare_file_payload_with_deserializer():
     serializer = DataSerializer(
-        dtype="inline",
+        dtype="file",
         serialize=lambda data: SerializedData(
-            dtype="inline",
-            inline_data={"value": "ok"},
-            file_bytes=None,
-            file_name=None,
-            metadata={"type": "inline"},
+            dtype="file",
+            inline_data=None,
+            file_bytes=b"payload",
+            file_name="payload.bin",
+            metadata={"type": "file"},
             deserializer_code="def decode(payload, spec):\n    return payload\n",
             deserializer_function="decode",
         ),
     )
     prepared = prepare_context_data(
-        object(), "inline", [serializer], max_payload_bytes=1024
+        object(), "file", [serializer], max_payload_bytes=1024
     )
 
     spec = prepared.context_dict["input_data_spec"]
-    assert spec["payload_inline"] == {"value": "ok"}
+    assert spec["payload_path"] is not None
     assert spec["deserializer_code"] is not None
     assert spec["deserializer_function"] == "decode"
 
 
-def test_inline_payload_requires_json_serializable():
+def test_inline_payload_rejected():
     serializer = DataSerializer(
         dtype="inline",
         serialize=lambda data: SerializedData(
             dtype="inline",
-            inline_data={1, 2},
+            inline_data={"value": "nope"},
             file_bytes=None,
             file_name=None,
             metadata={"type": "inline"},
         ),
     )
-    with pytest.raises(ValueError, match="Inline payload must be JSON-serializable"):
+    with pytest.raises(ValueError, match="Inline payloads are not supported"):
         prepare_context_data(object(), "inline", [serializer], max_payload_bytes=1024)
 
 

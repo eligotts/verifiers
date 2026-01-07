@@ -101,12 +101,12 @@ def prepare_context_data(
     serializer = resolve_data_serializer(data, dtype, serializers)
     serialized = serializer.serialize(data)
 
-    if serialized.file_bytes is not None and serialized.inline_data is not None:
+    if serialized.inline_data is not None:
         raise ValueError(
-            "Serialized data cannot include both inline data and file bytes."
+            "Inline payloads are not supported. Provide file bytes via the serializer."
         )
-    if serialized.file_bytes is None and serialized.inline_data is None:
-        raise ValueError("Serialized data must include inline data or file bytes.")
+    if serialized.file_bytes is None:
+        raise ValueError("Serialized data must include file bytes.")
 
     deserializer_code = serialized.deserializer_code or serializer.deserializer_code
     deserializer_function = (
@@ -119,26 +119,14 @@ def prepare_context_data(
     payload_size = None
     payload_hash = None
 
-    if serialized.file_bytes is not None:
-        payload_bytes = serialized.file_bytes
-        payload_name = validate_file_name(
-            serialized.file_name or default_payload_file_name(serialized)
-        )
-        payload_path = f"/tmp/{payload_name}"
-        payload_size = len(payload_bytes)
-        payload_hash = hashlib.sha256(payload_bytes).hexdigest()
-        ensure_payload_size(payload_size, max_payload_bytes)
-    else:
-        inline_data = serialized.inline_data
-        try:
-            inline_bytes = json.dumps(inline_data).encode("utf-8")
-        except TypeError as exc:
-            raise ValueError(
-                "Inline payload must be JSON-serializable. "
-                "Provide file bytes or a custom serializer."
-            ) from exc
-        inline_size = len(inline_bytes)
-        ensure_payload_size(inline_size, max_payload_bytes)
+    payload_bytes = serialized.file_bytes
+    payload_name = validate_file_name(
+        serialized.file_name or default_payload_file_name(serialized)
+    )
+    payload_path = f"/tmp/{payload_name}"
+    payload_size = len(payload_bytes)
+    payload_hash = hashlib.sha256(payload_bytes).hexdigest()
+    ensure_payload_size(payload_size, max_payload_bytes)
 
     metadata = build_metadata(
         data,
@@ -151,7 +139,6 @@ def prepare_context_data(
     spec = {
         "dtype": serialized.dtype,
         "format": serialized.format,
-        "payload_inline": serialized.inline_data,
         "payload_path": payload_path,
         "payload_encoding": serialized.encoding,
         "deserializer_code": deserializer_code,

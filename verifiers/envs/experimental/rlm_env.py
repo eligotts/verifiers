@@ -289,19 +289,17 @@ _RLM_WORKER_SCRIPT = textwrap.dedent(
             _full_context = json.load(f)
             data_spec = _full_context.get("input_data_spec") or {{}}
             if data_spec:
-                payload_inline = data_spec.get("payload_inline")
                 payload_path = data_spec.get("payload_path")
                 payload_encoding = data_spec.get("payload_encoding")
                 payload = None
-                if payload_inline is not None:
-                    payload = payload_inline
-                elif payload_path:
-                    if payload_encoding:
-                        with open(payload_path, "r", encoding=payload_encoding) as pf:
-                            payload = pf.read()
-                    else:
-                        with open(payload_path, "rb") as pf:
-                            payload = pf.read()
+                if not payload_path:
+                    raise ValueError("input_data_spec is missing payload_path")
+                if payload_encoding:
+                    with open(payload_path, "r", encoding=payload_encoding) as pf:
+                        payload = pf.read()
+                else:
+                    with open(payload_path, "rb") as pf:
+                        payload = pf.read()
 
                 dtype = data_spec.get("dtype", "")
                 deserializer_code = data_spec.get("deserializer_code")
