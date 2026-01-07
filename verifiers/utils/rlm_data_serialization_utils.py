@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import inspect
 import json
+import math
 import textwrap
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -386,7 +387,7 @@ def build_builtin_serializer() -> DataSerializer:
                 "types, range, slice, and complex."
             )
         encoded = encode_builtin_value(data)
-        return json.dumps(encoded, ensure_ascii=True).encode("utf-8")
+        return json.dumps(encoded, ensure_ascii=True, allow_nan=False).encode("utf-8")
 
     return build_custom_serializer(
         dtype="builtin",
@@ -416,8 +417,16 @@ def is_builtin_data(value: Any) -> bool:
 
 
 def encode_builtin_value(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if value is None or isinstance(value, (bool, int, str)):
         return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        if math.isnan(value):
+            return {_BUILTIN_TAG: "float", "value": "nan"}
+        if value > 0:
+            return {_BUILTIN_TAG: "float", "value": "inf"}
+        return {_BUILTIN_TAG: "float", "value": "-inf"}
     if isinstance(value, bytes):
         return {
             _BUILTIN_TAG: "bytes",
@@ -495,6 +504,15 @@ def deserialize_builtin(payload: Any, spec: dict[str, Any]) -> Any:
                 return bytearray(base64.b64decode(value["data"].encode("ascii")))
             if tag == "memoryview":
                 return memoryview(base64.b64decode(value["data"].encode("ascii")))
+            if tag == "float":
+                float_value = value.get("value")
+                if float_value == "nan":
+                    return float("nan")
+                if float_value == "inf":
+                    return float("inf")
+                if float_value == "-inf":
+                    return float("-inf")
+                raise ValueError(f"Unsupported float marker: {float_value}")
             if tag == "complex":
                 return complex(value["real"], value["imag"])
             if tag == "range":

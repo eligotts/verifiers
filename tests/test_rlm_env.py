@@ -1,6 +1,7 @@
 """Tests for the RLMEnv class."""
 
 import json
+import math
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,6 +13,8 @@ from verifiers.utils.rlm_data_serialization_utils import (
     DataSerializer,
     SerializedData,
     build_default_data_serializers,
+    build_builtin_serializer,
+    deserialize_builtin,
     prepare_context_data,
 )
 from verifiers.envs.experimental import rlm_env as rlm_module
@@ -678,6 +681,17 @@ class TestDataSerialization:
         )
         with pytest.raises(ValueError, match="Ambiguous data type"):
             prepare_context_data(object(), None, [serializer_a, serializer_b], None)
+
+    def test_builtin_serializer_handles_special_floats(self):
+        serializer = build_builtin_serializer()
+        data = {"values": [float("nan"), float("inf"), float("-inf")]}
+        serialized = serializer.serialize(data)
+        assert serialized.file_bytes is not None
+        decoded = deserialize_builtin(serialized.file_bytes, {})
+        values = decoded["values"]
+        assert math.isnan(values[0])
+        assert values[1] == float("inf")
+        assert values[2] == float("-inf")
 
 
 class TestCleanupRLMState:
