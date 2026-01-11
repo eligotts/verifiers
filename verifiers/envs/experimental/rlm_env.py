@@ -1020,6 +1020,7 @@ class RLMEnv(SandboxEnv):
     ) -> Any | None:
         """Make a single sub-LLM API call with timeout. Returns None on timeout."""
         normalized_messages = self._normalize_message_content(messages)
+        logprobs_support = self._sub_llm_supports_logprobs
 
         async def _create_call(logprobs: bool | None) -> Any:
             return await asyncio.wait_for(
@@ -1033,9 +1034,9 @@ class RLMEnv(SandboxEnv):
             )
 
         try:
-            if self._sub_llm_supports_logprobs is False:
+            if logprobs_support is False:
                 return await _create_call(None)
-            if self._sub_llm_supports_logprobs is True:
+            if logprobs_support is True:
                 return await _create_call(True)
 
             # Unknown support: try logprobs=True once, then fallback on param errors.
@@ -1048,11 +1049,9 @@ class RLMEnv(SandboxEnv):
             )
             return None
         except Exception as e:
-            if (
-                self._sub_llm_supports_logprobs is None
-                and self._is_logprobs_param_error(e)
-            ):
-                self._sub_llm_supports_logprobs = False
+            if logprobs_support is None and self._is_logprobs_param_error(e):
+                if self._sub_llm_supports_logprobs is None:
+                    self._sub_llm_supports_logprobs = False
                 try:
                     return await _create_call(None)
                 except asyncio.TimeoutError:

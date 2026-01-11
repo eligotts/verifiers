@@ -1356,6 +1356,32 @@ class TestSubLLMLogprobs:
         call_kwargs = mock_client.chat.completions.create.call_args.kwargs
         assert call_kwargs["logprobs"] is True
 
+    @pytest.mark.asyncio
+    async def test_lazy_logprobs_fallback_if_flag_flips(self, rlm_env):
+        """Retries without logprobs even if another call flips the flag."""
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        call_count = 0
+
+        async def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                rlm_env._sub_llm_supports_logprobs = False
+                raise Exception("logprobs not supported")
+            return mock_response
+
+        mock_client.chat.completions.create = AsyncMock(side_effect=side_effect)
+
+        rlm_env._sub_llm_supports_logprobs = None
+        messages = [{"role": "user", "content": "hi"}]
+        result = await rlm_env._call_sub_llm_api(mock_client, "gpt-4", messages)
+
+        assert result is mock_response
+        calls = mock_client.chat.completions.create.call_args_list
+        assert calls[0].kwargs["logprobs"] is True
+        assert calls[1].kwargs["logprobs"] is None
+
 
 # =============================================================================
 # 8. Interception Server
