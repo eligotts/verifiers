@@ -79,6 +79,10 @@ def main():
         "--perfect-score", type=float, default=None,
         help="If set, dont reflect on minibatches with this score",
     )
+    parser.add_argument(
+        "--state-columns", type=str, nargs="*", default=[],
+        help="Additional state columns to copy to reflection dataset",
+    )
 
     # Dataset sizes
     parser.add_argument("--num-train", "-n", type=int, default=DEFAULT_NUM_TRAIN, help="Training examples")
@@ -156,6 +160,7 @@ def main():
         max_metric_calls=args.max_calls,
         minibatch_size=args.minibatch_size,
         perfect_score=args.perfect_score,
+        state_columns=args.state_columns,
         num_train=args.num_train,
         num_val=args.num_val,
         max_concurrent=args.max_concurrent,
@@ -177,6 +182,7 @@ def run_gepa_optimization(
     max_metric_calls: int,
     minibatch_size: int,
     perfect_score: float | None,
+    state_columns: list[str],
     num_train: int,
     num_val: int,
     max_concurrent: int,
@@ -240,6 +246,7 @@ def run_gepa_optimization(
         model=model,
         sampling_args=sampling_args,
         max_concurrent=max_concurrent,
+        state_columns=state_columns,
         display=display,
     )
 
@@ -290,6 +297,7 @@ def run_gepa_optimization(
             "max_metric_calls": max_metric_calls,
             "minibatch_size": minibatch_size,
             "perfect_score": perfect_score,
+            "state_columns": state_columns,
             "seed": seed,
         }
         save_gepa_results(run_dir, result, config=run_config)
