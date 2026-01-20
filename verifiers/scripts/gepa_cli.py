@@ -10,6 +10,8 @@ import logging
 import os
 from pathlib import Path
 
+from gepa import optimize
+
 import verifiers as vf
 from verifiers import setup_logging
 from verifiers.gepa.adapter import VerifiersGEPAAdapter, make_reflection_lm
@@ -110,12 +112,22 @@ def main():
         api_base_url = args.api_base_url if api_base_url_override else DEFAULT_API_BASE_URL
         model = args.model
 
-    # Resolve reflection model
+    # Resolve reflection model and its client config
     if args.reflection_model and args.reflection_model in endpoints:
         reflection_endpoint = endpoints[args.reflection_model]
         reflection_model = reflection_endpoint["model"]
+        reflection_api_key_var = reflection_endpoint["key"]
+        reflection_api_base_url = reflection_endpoint["url"]
+    elif args.reflection_model:
+        # Reflection model specified but not in endpoints - use defaults
+        reflection_model = args.reflection_model
+        reflection_api_key_var = api_key_var
+        reflection_api_base_url = api_base_url
     else:
-        reflection_model = args.reflection_model or model
+        # No reflection model specified - use main model config
+        reflection_model = model
+        reflection_api_key_var = api_key_var
+        reflection_api_base_url = api_base_url
 
     # Generate run_dir (save to environment folder like vf-eval)
     save_results = not args.no_save
@@ -128,6 +140,10 @@ def main():
 
     # Run optimization
     client_config = ClientConfig(api_key_var=api_key_var, api_base_url=api_base_url)
+    reflection_client_config = ClientConfig(
+        api_key_var=reflection_api_key_var,
+        api_base_url=reflection_api_base_url,
+    )
 
     run_gepa_optimization(
         env_id=args.env_id,
@@ -136,6 +152,7 @@ def main():
         model=model,
         reflection_model=reflection_model,
         client_config=client_config,
+        reflection_client_config=reflection_client_config,
         max_metric_calls=args.max_calls,
         minibatch_size=args.minibatch_size,
         perfect_score=args.perfect_score,
@@ -156,6 +173,7 @@ def run_gepa_optimization(
     model: str,
     reflection_model: str,
     client_config: ClientConfig,
+    reflection_client_config: ClientConfig,
     max_metric_calls: int,
     minibatch_size: int,
     perfect_score: float | None,
@@ -167,9 +185,6 @@ def run_gepa_optimization(
     run_dir: Path | None,
     save_results: bool,
 ):
-    """Run GEPA optimization."""
-    from gepa import optimize
-
     # Load environment
     logger.info(f"Loading environment: {env_id}")
     env = vf.load_environment(env_id=env_id, **env_args)
@@ -229,7 +244,7 @@ def run_gepa_optimization(
     )
 
     # Create reflection LM
-    reflection_lm = make_reflection_lm(client_config=client_config, model=reflection_model)
+    reflection_lm = make_reflection_lm(client_config=reflection_client_config, model=reflection_model)
 
     # Configure perfect score handling
     skip_perfect_score = perfect_score is not None

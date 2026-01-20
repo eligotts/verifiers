@@ -21,7 +21,7 @@ from rich.table import Table
 class ValsetRowState:
     """Tracks best score for a single valset row."""
     best_score: float = 0.0
-    best_candidate_idx: int = 0
+    best_candidate_idxs: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -125,11 +125,8 @@ class GEPADisplay:
                     pass
             self.state.phase = "selecting"
         elif "Proposed new text" in message:
-            self.state.phase = "reflecting"
-        elif "is better than old score" in message:
-            self.state.phase = "accepted"
-        elif "is not better than old score" in message:
-            self.state.phase = "rejected"
+            self.state.phase = "re-evaluating"
+        # Note: accepted/rejected phase is now set in update_eval() when post-reflection scores come in
 
         if self.live:
             self.live.update(self._render())
@@ -169,11 +166,15 @@ class GEPADisplay:
                 if row is None:
                     self.state.valset_rows[example_id] = ValsetRowState(
                         best_score=score,
-                        best_candidate_idx=candidate_idx,
+                        best_candidate_idxs=[candidate_idx],
                     )
                 elif score > row.best_score:
+                    # New best - replace
                     row.best_score = score
-                    row.best_candidate_idx = candidate_idx
+                    row.best_candidate_idxs = [candidate_idx]
+                elif score == row.best_score and candidate_idx not in row.best_candidate_idxs:
+                    # Tie - add to list
+                    row.best_candidate_idxs.append(candidate_idx)
         else:
             # Minibatch evaluation - track before/after for status display
             avg_score = sum(scores) / len(scores) if scores else 0.0
@@ -188,11 +189,15 @@ class GEPADisplay:
                     self.state.minibatch_skipped = True
                 else:
                     self.state.minibatch_skipped = False
+                    # Baseline done, now waiting for teacher LLM to reflect
+                    self.state.phase = "reflecting"
             else:
                 # This is the eval after reflection
                 self.state.minibatch_after = avg_score
                 if self.state.minibatch_before is not None:
                     self.state.minibatch_accepted = avg_score > self.state.minibatch_before
+                    # Set phase based on result
+                    self.state.phase = "accepted" if self.state.minibatch_accepted else "rejected"
 
         if self.live:
             self.live.update(self._render())
@@ -213,6 +218,7 @@ class GEPADisplay:
             "initial valset done": "green",
             "selecting": "blue",
             "reflecting": "magenta",
+            "re-evaluating": "cyan",
             "accepted": "bold green",
             "rejected": "red",
         }
@@ -255,7 +261,7 @@ class GEPADisplay:
         table = Table(show_header=True, header_style="bold", box=None)
         table.add_column("Row", style="cyan", width=6, justify="right")
         table.add_column("Best", style="green", width=6, justify="right")
-        table.add_column("Prompt#", style="yellow", width=8, justify="right")
+        table.add_column("Prompt#", style="yellow", justify="left")
 
         rows = self.state.valset_rows
         if not rows:
@@ -264,10 +270,11 @@ class GEPADisplay:
             for row_idx in sorted(rows.keys()):
                 row = rows[row_idx]
                 score_style = "green" if row.best_score >= 1.0 else "yellow" if row.best_score > 0 else "red"
+                prompts_str = ",".join(str(idx) for idx in row.best_candidate_idxs)
                 table.add_row(
                     str(row_idx),
                     f"[{score_style}]{row.best_score:.2f}[/]",
-                    str(row.best_candidate_idx),
+                    prompts_str,
                 )
 
         # Show summary line

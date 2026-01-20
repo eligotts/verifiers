@@ -136,6 +136,7 @@ class VerifiersGEPAAdapter:
         scores = eval_batch.scores
 
         records = []
+        # outputs, states, and scores should be the same length
         for output, state, score in zip(outputs, states, scores):
             record: dict[str, Any] = {
                 "query": _extract_user_query(output["prompt"]),
@@ -176,7 +177,10 @@ def _inject_system_prompt(
             inp_copy["prompt"] = f"{system_prompt}\n\n{prompt}"
         else:
             prompt = [dict(m) for m in prompt]
-            if prompt[0].get("role") == "system":
+            if not prompt:
+                # Empty prompt list - just add system message
+                prompt = [{"role": "system", "content": system_prompt}]
+            elif prompt[0].get("role") == "system":
                 prompt[0] = {**prompt[0], "content": system_prompt}
             else:
                 prompt = [{"role": "system", "content": system_prompt}] + prompt

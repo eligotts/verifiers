@@ -44,8 +44,10 @@ def save_gepa_results(
         val_subscores = state.get("prog_candidate_val_subscores", [])
 
     # Fallback to result object if state file doesn't have data
+    # Clear val_subscores too since they reference state file candidate indices
     if not candidates:
         candidates = getattr(result, "candidates", [])
+        val_subscores = []
 
     best_idx = getattr(result, "best_idx", 0)
     best_candidate = getattr(result, "best_candidate", {})
