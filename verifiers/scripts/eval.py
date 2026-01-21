@@ -18,6 +18,7 @@ from verifiers.utils.eval_utils import (
     load_endpoints,
     load_toml_config,
     run_evaluations,
+    run_evaluations_tui,
 )
 from verifiers.utils.install_utils import check_hub_env_installed
 
@@ -254,6 +255,13 @@ def main():
         help='Extra environment as JSON object (e.g., \'{"key": "value", "num": 42}\'). Passed to environment constructor.',
     )
     parser.add_argument(
+        "--tui",
+        "-u",
+        default=False,
+        action="store_true",
+        help="Use TUI mode for live evaluation display",
+    )
+    parser.add_argument(
         "--max-retries",
         type=int,
         default=0,
@@ -423,7 +431,10 @@ def main():
         logger.debug(f"Evaluation config: {config.model_dump_json(indent=2)}")
 
     eval_run_config = EvalRunConfig(evals=eval_configs)
-    asyncio.run(run_evaluations(eval_run_config))
+    if args.tui:
+        asyncio.run(run_evaluations_tui(eval_run_config))
+    else:
+        asyncio.run(run_evaluations(eval_run_config))
 
 
 if __name__ == "__main__":

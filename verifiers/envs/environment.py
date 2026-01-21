@@ -37,12 +37,15 @@ from verifiers.types import (
     DatasetBuilder,
     GenerateMetadata,
     GenerateOutputs,
+    LogCallback,
     Messages,
     MessageType,
     ModelResponse,
+    ProgressCallback,
     RolloutInput,
     RolloutTiming,
     SamplingArgs,
+    StartCallback,
     State,
 )
 from verifiers.utils.async_utils import maybe_retry, maybe_semaphore
@@ -866,6 +869,9 @@ class Environment(ABC):
         use_tqdm: bool = True,
         independent_scoring: bool = False,
         max_retries: int = 0,
+        on_start: StartCallback | None = None,
+        on_progress: ProgressCallback | None = None,
+        on_log: LogCallback | None = None,
     ) -> GenerateOutputs:
         """
         Generate rollouts for a set of inputs.
@@ -874,6 +880,10 @@ class Environment(ABC):
             inputs_list = inputs.to_list()
         elif isinstance(inputs, list):
             inputs_list = inputs
+
+        # notify caller of actual total count (useful when num_examples=-1)
+        if on_start is not None:
+            on_start(len(inputs_list))
 
         # resolve concurrency knobs
         gen_limit = max_concurrent_generation
@@ -936,9 +946,9 @@ class Environment(ABC):
             pbar_total = len(group_list)
             pbar_desc = f"Processing {len(group_list)} groups ({len(inputs_list)} total rollouts)"
 
-        # set up progress bar
+        # set up progress bar (only when use_tqdm=True and no external progress callback)
         pbar = None
-        if use_tqdm:
+        if use_tqdm and on_progress is None:
             from tqdm import tqdm
 
             pbar = tqdm(total=pbar_total, desc=pbar_desc, postfix=dict(reward="?"))
@@ -962,10 +972,13 @@ class Environment(ABC):
                         reward_sum += r
                         reward_count += 1
 
+                # update progress bar or call callback
                 if pbar is not None:
                     pbar.update(1)
                     if reward_count > 0:
                         pbar.set_postfix(reward=f"{reward_sum / reward_count:.3f}")
+                elif on_progress is not None:
+                    on_progress(all_states, states)
 
                 # save intermediate results
                 if (
@@ -1003,9 +1016,11 @@ class Environment(ABC):
             start_time,
         )
 
-        # Save if requested
+        # save if requested
         if save_results:
             save_rollout_results(results)
+            if on_log is not None:
+                on_log(f"Saved final results to {results['metadata']['path_to_save']}")
 
         return results
 
@@ -1070,8 +1085,12 @@ class Environment(ABC):
         state_columns: list[str] | None = None,
         save_results: bool = False,
         save_every: int = -1,
+        use_tqdm: bool = True,
         independent_scoring: bool = False,
         max_retries: int = 0,
+        on_start: StartCallback | None = None,
+        on_progress: ProgressCallback | None = None,
+        on_log: LogCallback | None = None,
         **kwargs,
     ) -> GenerateOutputs:
         """
@@ -1090,8 +1109,12 @@ class Environment(ABC):
             state_columns=state_columns,
             save_results=save_results,
             save_every=save_every,
+            use_tqdm=use_tqdm,
             independent_scoring=independent_scoring,
             max_retries=max_retries,
+            on_start=on_start,
+            on_progress=on_progress,
+            on_log=on_log,
             **kwargs,
         )
 

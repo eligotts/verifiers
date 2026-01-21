@@ -142,6 +142,11 @@ class State(dict):
 # oai tools
 JsonPrimitive = Literal["string", "number", "integer", "boolean", "array", "object"]
 
+# callbacks
+StartCallback = Callable[[int], None]  # total rollouts
+ProgressCallback = Callable[[list[State], list[State]], None]  # all_states, new_states
+LogCallback = Callable[[str], None]  # log messages
+
 
 class GenerateMetadata(TypedDict):
     """Pydantic model for generation metadata."""
@@ -241,6 +246,7 @@ class EvalConfig(BaseModel):
     max_retries: int = 0
     # logging
     verbose: bool = False
+    use_tqdm: bool = True
     # saving
     state_columns: list[str] | None = None
     save_results: bool = False
