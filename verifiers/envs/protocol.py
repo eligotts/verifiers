@@ -9,13 +9,14 @@ This allows multi-agent scenarios where the dataset is shared across environment
 """
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, List
 
 from datasets import Dataset
 from openai import AsyncOpenAI
 
 from verifiers.types import DatasetBuilder, RolloutInput, SamplingArgs, State
-from verifiers.utils.async_utils import maybe_semaphore
+from verifiers.utils.async_utils import NullAsyncContext, maybe_semaphore
 
 from .actor import Actor
 
@@ -292,12 +293,12 @@ class Protocol:
         Spawn child rollouts in sibling environments.
 
         Routes each input to its target environment based on the `task` field,
-        then calls run_group() for each environment.
+        then runs rollouts in parallel using asyncio.gather.
         Uses context stored by the enclosing generate() call.
 
         Args:
             inputs: List of rollout inputs (task field determines target env)
-            score: Whether to score the group (passed through to run_group)
+            score: Whether to score the rollouts after completion
 
         Returns:
             List of completed states from the child rollouts
@@ -308,28 +309,24 @@ class Protocol:
                 "Ensure you're calling spawn() from within an env_response or rollout."
             )
 
-        # Group inputs by target environment (using task field)
-        by_env: dict[str, list[RolloutInput]] = {}
-        for inp in inputs:
-            env_name = inp.get("task") or self._get_default_env()
-            by_env.setdefault(env_name, []).append(inp)
+        # Use NullAsyncContext for children to allow parallel execution
+        null_sem = NullAsyncContext()
 
-        # Run each environment's run_group()
-        all_states: list[State] = []
-        for env_name, env_inputs in by_env.items():
-            env = self.get_env(env_name)
-            child_states = await env.run_group(
-                env_inputs,
+        # Run all rollouts in parallel
+        all_states = await asyncio.gather(*(
+            self.get_env(inp.get("task") or self._get_default_env()).run_rollout(
+                inp,
                 client=self._client,
                 model=self._model,
                 gen_sampling_args=self._sampling_args or {},
-                gen_sem=self._gen_sem,
-                score_sem=self._score_sem,
+                gen_sem=null_sem,
+                score_sem=null_sem,
                 score=score,
             )
-            all_states.extend(child_states)
+            for inp in inputs
+        ))
 
-        return all_states
+        return list(all_states)
 
     async def evaluate(
         self,
