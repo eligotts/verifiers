@@ -267,21 +267,23 @@ def run_gepa_optimization(
 
     display.start()
     try:
-        result = optimize(
-            seed_candidate=seed_candidate,
-            trainset=trainset,
-            valset=valset,
-            adapter=adapter,
-            reflection_lm=reflection_lm,
-            max_metric_calls=max_metric_calls,
-            reflection_minibatch_size=minibatch_size,
-            run_dir=str(run_dir) if run_dir else None,
-            seed=seed,
-            display_progress_bar=False,
-            skip_perfect_score=skip_perfect_score,
-            perfect_score=perfect_score,
-            logger=display,
-        )
+        optimize_kwargs: dict = {
+            "seed_candidate": seed_candidate,
+            "trainset": trainset,
+            "valset": valset,
+            "adapter": adapter,
+            "reflection_lm": reflection_lm,
+            "max_metric_calls": max_metric_calls,
+            "reflection_minibatch_size": minibatch_size,
+            "run_dir": str(run_dir) if run_dir else None,
+            "seed": seed,
+            "display_progress_bar": False,
+            "skip_perfect_score": skip_perfect_score,
+            "logger": display,
+        }
+        if perfect_score is not None:
+            optimize_kwargs["perfect_score"] = perfect_score
+        result = optimize(**optimize_kwargs)
     finally:
         display.stop()
 

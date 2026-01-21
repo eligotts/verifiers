@@ -131,7 +131,7 @@ class VerifiersGEPAAdapter:
         components_to_update: list[str],
     ) -> Mapping[str, Sequence[Mapping[str, Any]]]:
         """Build reflective dataset for GEPA teacher LLM."""
-        outputs: list[dict[str, Any]] = eval_batch.outputs  # type: ignore[assignment]
+        outputs: list[dict[str, Any]] = eval_batch.outputs
         states: list[State] = eval_batch.trajectories or []
         scores = eval_batch.scores
 
@@ -196,7 +196,10 @@ def _extract_user_query(prompt: Messages) -> str:
         return prompt
     for msg in prompt:
         if msg.get("role") == "user":
-            return message_to_printable(msg).get("content", "")
+            content = message_to_printable(msg).get("content", "")
+            if isinstance(content, str):
+                return content
+            return str(content) if content else ""
     return ""
 
 
