@@ -240,7 +240,6 @@ class EvalConfig(BaseModel):
     extra_env_kwargs: dict = {}
     max_retries: int = 0
     # logging
-    print_results: bool = False
     verbose: bool = False
     # saving
     state_columns: list[str] | None = None
@@ -248,3 +247,9 @@ class EvalConfig(BaseModel):
     save_every: int = -1
     save_to_hf_hub: bool = False
     hf_hub_dataset_name: str | None = None
+
+
+class EvalRunConfig(BaseModel):
+    """Pydantic model for evaluation run configuration."""
+
+    evals: list[EvalConfig]

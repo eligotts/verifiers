@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import json
 import logging
@@ -7,12 +8,23 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
 
+try:
+    import tomllib  # type: ignore[import-not-found]
+except ImportError:
+    import tomli as tomllib  # type: ignore[import-not-found]
+
 import numpy as np
 from datasets import Dataset, disable_progress_bar, enable_progress_bar
 from datasets.utils import logging as ds_logging
 
 import verifiers as vf
-from verifiers.types import Endpoints, EvalConfig, GenerateMetadata, GenerateOutputs
+from verifiers.types import (
+    Endpoints,
+    EvalConfig,
+    EvalRunConfig,
+    GenerateMetadata,
+    GenerateOutputs,
+)
 from verifiers.utils.async_utils import EventLoopLagMonitor
 from verifiers.utils.client_utils import setup_client
 from verifiers.utils.error_utils import ErrorChain
@@ -57,6 +69,78 @@ def load_endpoints(endpoints_path: str):
         logger.debug("Using default empty endpoints registry")
         endpoints: Endpoints = {}
     return endpoints
+
+
+def load_toml_config(path: Path) -> list[dict]:
+    """Loads and validates a TOML config file.
+
+    Config format supports global defaults at the top level, with per-eval overrides:
+
+        # Global defaults (optional)
+        model = "openai/gpt-4.1-mini"
+        num_examples = 10
+
+        [[eval]]
+        env_id = "gsm8k"
+
+        [[eval]]
+        env_id = "math-python"
+        num_examples = 5  # overrides global default
+
+    Minimal config (just a single eval):
+
+        [[eval]]
+        env_id = "gsm8k"
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+
+    with open(path, "rb") as f:
+        raw_config = tomllib.load(f)
+
+    # validate schema
+    eval_list = raw_config.get("eval", [])
+    if not isinstance(eval_list, list):
+        raise ValueError(
+            f"Config file uses [eval] but should use [[eval]] (double brackets) "
+            f"for array of tables: {path}"
+        )
+    if not eval_list:
+        raise ValueError(
+            f"Config file must contain at least one [[eval]] section: {path}"
+        )
+
+    if not all("env_id" in e for e in eval_list):
+        raise ValueError(f"All [[eval]] sections must contain an env_id field: {path}")
+
+    # extract global defaults (everything except 'eval' key)
+    global_defaults = {k: v for k, v in raw_config.items() if k != "eval"}
+
+    valid_fields = set(EvalConfig.model_fields.keys())
+
+    # validate global fields
+    if global_defaults:
+        invalid_global = set(global_defaults.keys()) - valid_fields
+        if invalid_global:
+            raise ValueError(
+                f"Invalid global field(s) {invalid_global}. "
+                f"Valid fields are: {sorted(valid_fields)}"
+            )
+
+    # merge global defaults with per-eval configs
+    merged_eval_list: list[dict] = []
+    for eval_config in eval_list:
+        invalid_fields = set(eval_config.keys()) - valid_fields
+        if invalid_fields:
+            raise ValueError(
+                f"Invalid field(s) {invalid_fields} for {eval_config.get('env_id', 'unknown')}. "
+                f"Valid fields are: {sorted(valid_fields)}"
+            )
+        # global defaults, then per-eval overrides
+        merged = {**global_defaults, **eval_config}
+        merged_eval_list.append(merged)
+
+    return merged_eval_list
 
 
 def get_results_by_task(results: GenerateOutputs) -> dict[str, GenerateOutputs]:
@@ -160,7 +244,6 @@ def print_timing(results: GenerateOutputs):
 
 def print_results(
     results: GenerateOutputs,
-    event_loop_lags: list[float] | None = None,
     num_samples: int = 1,
 ):
     assert results["metadata"] is not None
@@ -197,34 +280,16 @@ def print_results(
             print_info(task_results)
             print_timing(task_results)
 
-    if event_loop_lags:
-        print("\nPerformance:")
-        event_loop_lags_arr = np.array(event_loop_lags)
-        med_lag, p90_lag, max_lag = (
-            np.median(event_loop_lags_arr),
-            np.percentile(event_loop_lags_arr, 90),
-            np.max(event_loop_lags_arr),
-        )
-        print(
-            f"event_loop_lag: med - {print_time(float(med_lag))}, p90 - {print_time(float(p90_lag))}, max - {print_time(float(max_lag))}"
-        )
-
 
 async def run_evaluation(config: EvalConfig) -> GenerateOutputs:
     # set up AsyncOpenAI client with high limits to prevent timeouts
-    client = setup_client(
-        config.client_config,
-    )
+    client = setup_client(config.client_config)
     logger.debug(
         f"Initialized AsyncOpenAI client with base_url: {config.client_config.api_base_url}"
     )
 
     # load environment
     vf_env = vf.load_environment(env_id=config.env_id, **config.env_args)
-
-    # load event loop lag monitor
-    event_loop_lag_monitor = EventLoopLagMonitor()
-    event_loop_lag_monitor.run_in_background()
 
     # set extra environment kwargs
     if config.extra_env_kwargs:
@@ -237,7 +302,6 @@ async def run_evaluation(config: EvalConfig) -> GenerateOutputs:
     logger.info(
         f"Configuration: num_examples={config.num_examples}, rollouts_per_example={config.rollouts_per_example}, max_concurrent={config.max_concurrent}"
     )
-    start_time = time.time()
     results = await vf_env.evaluate(
         client=client,
         model=config.model,
@@ -254,16 +318,39 @@ async def run_evaluation(config: EvalConfig) -> GenerateOutputs:
         independent_scoring=config.independent_scoring,
         max_retries=config.max_retries,
     )
-    end_time = time.time()
-    logger.info(f"Evaluation completed in {end_time - start_time:.2f} seconds")
 
-    event_loop_lags = event_loop_lag_monitor.get_lags()
-
-    if config.print_results:
-        print_results(results, event_loop_lags)
     if config.save_results:
         save_rollout_results(results, config.save_to_hf_hub, config.hf_hub_dataset_name)
     return results
+
+
+async def run_evaluations(config: EvalRunConfig) -> None:
+    # load event loop lag monitor
+    event_loop_lag_monitor = EventLoopLagMonitor()
+    event_loop_lag_monitor.run_in_background()
+
+    start_time = time.time()
+    all_results = await asyncio.gather(
+        *[run_evaluation(eval_config) for eval_config in config.evals]
+    )
+    end_time = time.time()
+    event_loop_lags = event_loop_lag_monitor.get_lags()
+    logger.info(f"Evaluation completed in {end_time - start_time:.2f} seconds")
+
+    for results in all_results:
+        print_results(results)
+
+    if event_loop_lags:
+        print("\nPerformance:")
+        event_loop_lags_arr = np.array(event_loop_lags)
+        med_lag, p90_lag, max_lag = (
+            np.median(event_loop_lags_arr),
+            np.percentile(event_loop_lags_arr, 90),
+            np.max(event_loop_lags_arr),
+        )
+        print(
+            f"event_loop_lag: med - {print_time(float(med_lag))}, p90 - {print_time(float(p90_lag))}, max - {print_time(float(max_lag))}"
+        )
 
 
 def sanitize_metadata(metadata: GenerateMetadata) -> dict:
