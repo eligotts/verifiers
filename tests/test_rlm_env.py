@@ -1,16 +1,20 @@
 """Tests for the RLMEnv class (filesystem-based, local-only)."""
 
+import ast
 import base64
+import contextlib
+import io
 import json
-import pickle
 import os
+import pickle
 import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from datasets import Dataset
-from verifiers.envs.experimental.rlm_env import RLMEnv
+from verifiers.envs.experimental import rlm_env as rlm_module
+from verifiers.envs.experimental.rlm_env import RLMEnv, RLMWorkerPaths
 
 
 # =============================================================================
@@ -33,6 +37,13 @@ def build_env(dataset: Dataset, **kwargs) -> RLMEnv:
         return RLMEnv(dataset=dataset, **kwargs)
 
 
+def extract_bash_helper_source() -> str:
+    template = rlm_module._RLM_BASH_TOOL_HELPER_SCRIPT
+    if "def main" in template:
+        return template
+    return template
+
+
 # =============================================================================
 # Fixtures
 # =============================================================================
@@ -41,7 +52,12 @@ def build_env(dataset: Dataset, **kwargs) -> RLMEnv:
 @pytest.fixture
 def rlm_env() -> RLMEnv:
     dataset = make_dataset({})
-    return build_env(dataset, max_iterations=10, max_output_length=1000)
+    return build_env(
+        dataset,
+        max_iterations=10,
+        max_output_length=1000,
+        repl_language="python",
+    )
 
 
 @pytest.fixture
@@ -56,7 +72,21 @@ def rlm_env_with_sub_tools() -> RLMEnv:
 
     dataset = make_dataset({})
     return build_env(
-        dataset, sub_tools=[sample_tool, another_tool], sub_tool_max_turns=3
+        dataset,
+        sub_tools=[sample_tool, another_tool],
+        sub_tool_max_turns=3,
+        repl_language="python",
+    )
+
+
+@pytest.fixture
+def rlm_env_bash() -> RLMEnv:
+    dataset = make_dataset({})
+    return build_env(
+        dataset,
+        max_iterations=10,
+        max_output_length=1000,
+        repl_language="bash",
     )
 
 
@@ -347,15 +377,296 @@ class TestFilesystemCleanup:
             shutil.rmtree(rollout_dir, ignore_errors=True)
 
 
+class TestBashPrompt:
+    @pytest.mark.asyncio
+    async def test_bash_prompt_mentions_env_vars(self, rlm_env_bash):
+        env = rlm_env_bash
+        env._ensure_interception_server = AsyncMock()
+        env._executor.setup = AsyncMock()
+
+        state = {"info": {}, "model": "m", "client": MagicMock()}
+        result = await env.setup_state(state)
+        try:
+            prompt = result["rlm_system_prompt"]
+            assert "RLM_READY" in prompt
+            assert "RLM_CONTENT" in prompt
+        finally:
+            await env.cleanup_rlm_state(result)
+
+
+class TestBashReplOutput:
+    @pytest.mark.asyncio
+    async def test_bash_output_is_raw(self, rlm_env_bash):
+        rlm_env_bash._execute_code = AsyncMock(
+            return_value={
+                "status": "ok",
+                "stdout": "output",
+                "stderr": "warning",
+                "result": None,
+                "execution_count": 1,
+                "answer": {"ready": False, "content": ""},
+            }
+        )
+
+        state = {"trajectory": [], "context_warning_sent": False}
+        output = await rlm_env_bash.call_bash_repl("echo hi", state)
+
+        assert "output" in output
+        assert "warning" in output
+        assert "stderr:" not in output
+        assert "Out[" not in output
+        assert "[Execution time" not in output
+
+
+class TestBashWorkerScript:
+    def test_rendered_bash_worker_is_valid_python(self, tmp_path: Path):
+        paths = RLMWorkerPaths(
+            base_dir=str(tmp_path),
+            command_fifo=str(tmp_path / "cmd"),
+            response_fifo=str(tmp_path / "res"),
+            ready_flag=str(tmp_path / "ready"),
+            worker_path=str(tmp_path / "worker.py"),
+            worker_pid_file=str(tmp_path / "worker.pid"),
+            context_file=str(tmp_path / "context.json"),
+            answer_file=str(tmp_path / "answer.json"),
+            log_file=str(tmp_path / "worker.log"),
+        )
+        script = rlm_module._render_worker_script(paths, repl_language="bash")
+        ast.parse(script)
+
+    def test_bash_worker_escapes_exit_code_marker(self, tmp_path: Path):
+        paths = RLMWorkerPaths(
+            base_dir=str(tmp_path),
+            command_fifo=str(tmp_path / "cmd"),
+            response_fifo=str(tmp_path / "res"),
+            ready_flag=str(tmp_path / "ready"),
+            worker_path=str(tmp_path / "worker.py"),
+            worker_pid_file=str(tmp_path / "worker.pid"),
+            context_file=str(tmp_path / "context.json"),
+            answer_file=str(tmp_path / "answer.json"),
+            log_file=str(tmp_path / "worker.log"),
+        )
+        script = rlm_module._render_worker_script(paths, repl_language="bash")
+        assert '"$?"' in script
+        assert "__RLM_ENV__" in script
+
+
+class TestBashToolHelper:
+    def _run_helper(
+        self,
+        argv: list[str],
+        stdin_data: str = "",
+        response_data: dict | None = None,
+    ) -> tuple[str, str, int, dict | None]:
+        helper_source = extract_bash_helper_source()
+        stdout_buffer = io.StringIO()
+        stderr_buffer = io.StringIO()
+        env = {
+            "RLM_ROOT_TOOL_URL": "http://example.invalid/",
+            "RLM_ROOT_TOOL_SERIALIZATION": "pickle",
+        }
+        captured_payload: dict | None = None
+        with patch("urllib.request.urlopen") as mock_urlopen:
+
+            def _capture_request(req, timeout=300):
+                nonlocal captured_payload
+                data = json.loads(req.data.decode("utf-8"))
+                args = list(pickle.loads(base64.b64decode(data["args"])))
+                kwargs = pickle.loads(base64.b64decode(data["kwargs"]))
+                captured_payload = {
+                    "tool_name": data.get("tool_name"),
+                    "args": args,
+                    "kwargs": kwargs,
+                }
+                return response
+
+            response = MagicMock()
+            response.__enter__.return_value = response
+            response.__exit__.return_value = None
+            if response_data is None:
+                response_data = {
+                    "result": base64.b64encode(pickle.dumps(["ok"])).decode("ascii"),
+                    "error": None,
+                }
+            response.read.return_value = json.dumps(response_data).encode("utf-8")
+            mock_urlopen.return_value.__enter__.return_value = response
+            mock_urlopen.side_effect = _capture_request
+            namespace = {"__name__": "__main__"}
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch("sys.argv", ["rlm_root_tool.py", *argv]),
+                patch("sys.stdin", io.StringIO(stdin_data)),
+                contextlib.redirect_stdout(stdout_buffer),
+                contextlib.redirect_stderr(stderr_buffer),
+            ):
+                try:
+                    exec(helper_source, namespace, namespace)
+                except SystemExit as exc:
+                    code = exc.code if isinstance(exc.code, int) else 1
+                else:
+                    code = 0
+        return (
+            stdout_buffer.getvalue(),
+            stderr_buffer.getvalue(),
+            code,
+            captured_payload,
+        )
+
+    def test_llm_batch_json_arg(self):
+        payload = json.dumps({"prompts": ["alpha", "beta"]})
+        stdout, stderr, code, captured = self._run_helper(
+            ["--tool", "llm_batch", "--json", payload]
+        )
+        assert code == 0
+        assert stderr == ""
+        assert "ok" in stdout
+        assert captured is not None
+        assert captured["tool_name"] == "llm_batch"
+        assert captured["args"][0] == ["alpha", "beta"]
+        assert captured["kwargs"] == {}
+
+    def test_tool_json_args_kwargs(self):
+        payload = json.dumps({"args": [1, 2], "kwargs": {"x": "y"}})
+        stdout, stderr, code, captured = self._run_helper(
+            ["--tool", "other_tool", "--json", payload]
+        )
+        assert code == 0
+        assert stderr == ""
+        assert "ok" in stdout
+        assert captured is not None
+        assert captured["tool_name"] == "other_tool"
+        assert captured["args"] == [1, 2]
+        assert captured["kwargs"] == {"x": "y"}
+
+    def test_llm_batch_positional_args(self):
+        stdout, stderr, code, captured = self._run_helper(
+            ["--tool", "llm_batch", "first", "second"]
+        )
+        assert code == 0
+        assert stderr == ""
+        assert "ok" in stdout
+        assert captured is not None
+        assert captured["args"][0] == ["first", "second"]
+
+    def test_llm_batch_json_stdin(self):
+        payload = json.dumps({"prompts": ["stdin"]})
+        stdout, stderr, code, captured = self._run_helper(
+            ["--tool", "llm_batch", "--json"], stdin_data=payload
+        )
+        assert code == 0
+        assert stderr == ""
+        assert "ok" in stdout
+        assert captured is not None
+        assert captured["args"][0] == ["stdin"]
+
+    def test_tool_json_kwargs_only(self):
+        payload = json.dumps({"flag": True, "name": "test"})
+        stdout, stderr, code, captured = self._run_helper(
+            ["--tool", "other_tool", "--json", payload]
+        )
+        assert code == 0
+        assert stderr == ""
+        assert captured is not None
+        assert captured["args"] == []
+        assert captured["kwargs"] == {"flag": True, "name": "test"}
+
+    def test_tool_json_list_args(self):
+        payload = json.dumps([1, "two", False])
+        stdout, stderr, code, captured = self._run_helper(
+            ["--tool", "other_tool", "--json", payload]
+        )
+        assert code == 0
+        assert stderr == ""
+        assert captured is not None
+        assert captured["args"] == [1, "two", False]
+        assert captured["kwargs"] == {}
+
+    def test_tool_json_scalar_arg(self):
+        payload = json.dumps("solo")
+        stdout, stderr, code, captured = self._run_helper(
+            ["--tool", "other_tool", "--json", payload]
+        )
+        assert code == 0
+        assert stderr == ""
+        assert captured is not None
+        assert captured["args"] == ["solo"]
+        assert captured["kwargs"] == {}
+
+    def test_tool_json_extra_args_error(self):
+        payload = json.dumps({"args": [1]})
+        stdout, stderr, code, captured = self._run_helper(
+            ["--tool", "other_tool", "--json", payload, "extra"]
+        )
+        assert code != 0
+        assert "does not accept extra args" in stderr
+        assert captured is None
+
+    def test_llm_batch_json_extra_args_error(self):
+        payload = json.dumps({"prompts": ["x"]})
+        stdout, stderr, code, captured = self._run_helper(
+            ["--tool", "llm_batch", "--json", payload, "extra"]
+        )
+        assert code != 0
+        assert "does not accept extra args" in stderr
+        assert captured is None
+
+    def test_tool_json_invalid_error(self):
+        stdout, stderr, code, captured = self._run_helper(
+            ["--tool", "other_tool", "--json", "{invalid"]
+        )
+        assert code != 0
+        assert "Invalid JSON payload" in stderr
+        assert captured is None
+
+    def test_llm_batch_output_headers_with_metadata(self):
+        payload = json.dumps({"prompts": ["one", "two"]})
+        response_data = {
+            "result": base64.b64encode(pickle.dumps(["first", "second"])).decode(
+                "ascii"
+            ),
+            "error": None,
+            "print_lines": [
+                "llm_batch: 2 call(s) in 0.10s",
+                "  [0]: 5 tokens, 0 tool calls, 0.01s ✓",
+                "  [1]: 6 tokens, 1 tool calls, 0.02s ✓",
+            ],
+        }
+        stdout, stderr, code, captured = self._run_helper(
+            ["--tool", "llm_batch", "--json", payload], response_data=response_data
+        )
+        assert code == 0
+        assert stderr == ""
+        assert "llm_batch: 2 call(s) in 0.10s" in stdout
+        assert "----- llm_batch[0]" in stdout
+        assert "----- llm_batch[1]" in stdout
+        assert "first" in stdout
+        assert "second" in stdout
+
+
 # =============================================================================
 # 3. Initialization and Configuration
 # =============================================================================
 
 
 class TestRLMEnvInitialization:
-    def test_default_initialization(self):
+    def test_default_repl_language_is_bash(self):
         dataset = make_dataset({})
         env = build_env(dataset)
+
+        assert getattr(env, "repl_language", None) == "bash"
+        assert "call_bash_repl" in env.tool_map
+        assert "call_python_repl" not in env.tool_map
+
+    def test_python_repl_tool_registered(self):
+        dataset = make_dataset({})
+        env = build_env(dataset, repl_language="python")
+
+        assert "call_python_repl" in env.tool_map
+        assert "call_bash_repl" not in env.tool_map
+
+    def test_default_initialization(self):
+        dataset = make_dataset({})
+        env = build_env(dataset, repl_language="python")
 
         assert env.sub_model is None
         assert env.sub_tools == []
@@ -383,6 +694,7 @@ class TestRLMEnvInitialization:
             sub_llm_stagger_jitter_ms=5,
             context_key="custom_context",
             context_dir_key="custom_context_dir",
+            repl_language="python",
         )
 
         assert env.sub_model == "gpt-4"
@@ -398,7 +710,7 @@ class TestRLMEnvInitialization:
     def test_system_prompt_customization(self):
         custom_prompt = "You are a custom RLM assistant."
         dataset = make_dataset({})
-        env = build_env(dataset, system_prompt=custom_prompt)
+        env = build_env(dataset, system_prompt=custom_prompt, repl_language="python")
         assert env.custom_system_prompt == custom_prompt
 
     def test_bash_tool_removed(self, rlm_env):
@@ -576,6 +888,36 @@ class TestContextLimitWarning:
         assert "8,000" in output
         assert "10,000" in output
         assert "80%" in output
+        assert state["context_warning_sent"] is True
+
+    @pytest.mark.asyncio
+    async def test_bash_warning_at_threshold(self, rlm_env_bash):
+        rlm_env_bash.max_seq_len = 10000
+        rlm_env_bash._execute_code = AsyncMock(
+            return_value={
+                "status": "ok",
+                "stdout": "output",
+                "stderr": "",
+                "result": None,
+                "execution_count": 1,
+                "answer": {"ready": False, "content": ""},
+            }
+        )
+
+        mock_response = MagicMock()
+        mock_response.usage = MagicMock(prompt_tokens=8000)
+        state = {
+            "trajectory": [{"response": mock_response}],
+            "context_warning_sent": False,
+        }
+
+        output = await rlm_env_bash.call_bash_repl("echo test", state)
+
+        assert "[CONTEXT LIMIT WARNING]" in output
+        assert "8,000" in output
+        assert "10,000" in output
+        assert "80%" in output
+        assert "RLM_READY=1" in output
         assert state["context_warning_sent"] is True
 
 
