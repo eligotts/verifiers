@@ -37,6 +37,8 @@ from verifiers.types import (
     DatasetBuilder,
     GenerateMetadata,
     GenerateOutputs,
+    LLMClient,
+    LLMClientMap,
     LogCallback,
     Messages,
     MessageType,
@@ -47,8 +49,6 @@ from verifiers.types import (
     SamplingArgs,
     StartCallback,
     State,
-    ClientConfig,
-    LLMClient,
 )
 from verifiers.utils.async_utils import maybe_retry, maybe_semaphore
 from verifiers.utils.error_utils import ErrorChain
@@ -624,7 +624,7 @@ class Environment(ABC):
     async def init_state(
         self,
         input: RolloutInput,
-        client: ClientConfig | LLMClient,
+        client: LLMClientMap | LLMClient,
         model: str,
         sampling_args: SamplingArgs | None = None,
     ) -> State:
@@ -677,7 +677,7 @@ class Environment(ABC):
     async def rollout(
         self,
         input: RolloutInput,
-        client: AsyncOpenAI,
+        client: LLMClientMap | LLMClient,
         model: str,
         sampling_args: SamplingArgs | None = None,
     ) -> State:

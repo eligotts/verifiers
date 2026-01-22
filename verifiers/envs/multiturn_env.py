@@ -6,14 +6,14 @@ from openai import AsyncOpenAI
 
 import verifiers as vf
 from verifiers.types import (
+    LLMClient,
+    LLMClientMap,
     Messages,
     ModelResponse,
     RolloutInput,
     SamplingArgs,
     State,
     TrajectoryStep,
-    ClientConfig,
-    LLMClient,
 )
 from verifiers.utils.message_utils import concat_messages
 from verifiers.utils.response_utils import (
@@ -144,7 +144,7 @@ class MultiTurnEnv(vf.Environment):
     async def rollout(
         self,
         input: RolloutInput,
-        client: ClientConfig | LLMClient,
+        client: LLMClientMap | LLMClient,
         model: str,
         sampling_args: SamplingArgs | None = None,
     ) -> State:

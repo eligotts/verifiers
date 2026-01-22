@@ -51,8 +51,8 @@ IndividualRewardFunc = Callable[..., float | Awaitable[float]]
 GroupRewardFunc = Callable[..., list[float] | Awaitable[list[float]]]
 RewardFunc = IndividualRewardFunc | GroupRewardFunc
 DatasetBuilder = Callable[[], Dataset]
-LLMClient = AsyncOpenAI # add anthropic support later
-ClientConfig = dict[str, LLMClient]
+LLMClient = AsyncOpenAI  # add anthropic support later
+LLMClientMap = dict[str, LLMClient]
 
 
 class TrajectoryStepTokens(TypedDict):
@@ -101,7 +101,7 @@ class State(dict):
     INPUT_FIELDS = ["prompt", "answer", "task", "info", "example_id"]
     # rollout inputs
     input: RolloutInput
-    client: ClientConfig
+    client: LLMClientMap
     current_client: str
     model: str
     sampling_args: SamplingArgs | None
