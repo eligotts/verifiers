@@ -287,10 +287,10 @@ def run_gepa_optimization(
 
         # Get datasets
         logger.debug(f"Loading trainset ({num_train} examples)")
-        trainset = env.get_dataset(n=num_train).to_list()
+        trainset = env.get_dataset(n=num_train, seed=seed).to_list()
 
         logger.debug(f"Loading valset ({num_val} examples)")
-        valset = env.get_eval_dataset(n=num_val).to_list()
+        valset = env.get_eval_dataset(n=num_val, seed=seed).to_list()
 
         # Update display with actual valset info
         valset_example_ids = [
