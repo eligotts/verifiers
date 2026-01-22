@@ -1,0 +1,22 @@
+[project]
+name = "wordle_rlm"
+description = "Wordle game environment using RLM (code-based gameplay with persistent state)"
+tags = ["textarena", "rlm", "multi-turn", "reasoning", "game", "code", "train", "eval"]
+version = "0.1.0"
+dependencies = [
+    "verifiers>=0.1.9.post3",
+    "nltk>=3.9.2",
+    "textarena>=0.7.4",
+    "prime-sandboxes>=0.1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = ["wordle_rlm.py"]
+
+[tool.verifiers.eval]
+num_examples = 10
+rollouts_per_example = 1
