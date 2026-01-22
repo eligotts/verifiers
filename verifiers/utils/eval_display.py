@@ -1,33 +1,24 @@
 """
-Rich-based TUI for live multi-environment evaluation display.
+Rich-based display for live multi-environment evaluation.
+
+Provides a visual progress display that works in two modes:
+- Default (screen=False): Rich panels refresh in-place without screen hijacking
+- TUI mode (screen=True): Alternate screen buffer with echo handling
 """
 
-import asyncio
-import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-# check for unix-specific terminal control modules
-try:
-    import select  # noqa: F401
-    import termios  # noqa: F401
-    import tty  # noqa: F401
-
-    HAS_TERMINAL_CONTROL = True
-except ImportError:
-    HAS_TERMINAL_CONTROL = False
-
-from rich.console import Console, Group
-from rich.layout import Layout
-from rich.live import Live
+from rich.console import Group
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 from rich.text import Text
 
 from verifiers.types import EvalConfig
+from verifiers.utils.display_utils import BaseDisplay, make_aligned_row
 
 
 @dataclass
@@ -63,7 +54,7 @@ class EnvEvalState:
 
 
 @dataclass
-class EvalTUIState:
+class EvalDisplayState:
     """Dynamic eval state for multiple envs."""
 
     envs: dict[int, EnvEvalState] = field(default_factory=dict)
@@ -78,12 +69,19 @@ class EvalTUIState:
         return all(env.status in ("completed", "failed") for env in self.envs.values())
 
 
-class EvalTUI:
-    def __init__(self, configs: list[EvalConfig]):
-        self.state = EvalTUIState()
-        self.console = Console()
-        self._live: Live | None = None
-        self._old_terminal_settings: list | None = None
+class EvalDisplay(BaseDisplay):
+    """
+    Rich-based display for multi-environment evaluation.
+
+    Args:
+        configs: List of EvalConfig objects for the environments being evaluated.
+        screen: If True, use alternate screen buffer (TUI mode via --tui flag).
+                If False (default), refresh in-place without screen hijacking.
+    """
+
+    def __init__(self, configs: list[EvalConfig], screen: bool = False) -> None:
+        super().__init__(screen=screen, refresh_per_second=4)
+        self.state = EvalDisplayState()
 
         # store configs by index to handle duplicate env_ids
         self.configs: list[EvalConfig] = list(configs)
@@ -196,13 +194,7 @@ class EvalTUI:
             error_text.append("error rate ", style="dim")
             error_text.append(error_rate_str, style=f"bold {error_color}")
 
-        # create a table with two columns for left/right alignment
-        table = Table.grid(expand=True)
-        table.add_column(justify="left", ratio=1)
-        table.add_column(justify="right")
-        table.add_row(metrics_text, error_text)
-
-        return table
+        return make_aligned_row(metrics_text, error_text)
 
     def _make_env_panel(self, env_idx: int) -> Panel:
         """Create a full-width panel for a single environment with config and progress."""
@@ -329,6 +321,7 @@ class EvalTUI:
             title_align="left",
             border_style=border_style,
             padding=(1, 1),
+            expand=True,
         )
 
     def _make_env_stack(self) -> Group:
@@ -344,164 +337,116 @@ class EvalTUI:
     def _make_footer(self) -> Panel:
         """Create the footer panel with instructions."""
         if self.state.all_completed:
-            footer_text = Text()
-            footer_text.append("Press ", style="dim")
-            footer_text.append("q", style="bold cyan")
-            footer_text.append(" or ", style="dim")
-            footer_text.append("Enter", style="bold cyan")
-            footer_text.append(" to exit", style="dim")
+            if self.screen:
+                # TUI mode - show exit instructions
+                footer_text = Text()
+                footer_text.append("Press ", style="dim")
+                footer_text.append("q", style="bold cyan")
+                footer_text.append(" or ", style="dim")
+                footer_text.append("Enter", style="bold cyan")
+                footer_text.append(" to exit", style="dim")
+            else:
+                # Normal mode - no exit prompt needed
+                footer_text = Text()
+                footer_text.append("Evaluation complete", style="dim")
             return Panel(footer_text, border_style="dim")
         else:
-            footer_text = Text()
-            footer_text.append("Press ", style="dim")
-            footer_text.append("Ctrl+C", style="bold yellow")
-            footer_text.append(" to interrupt", style="dim")
+            if self.screen:
+                # TUI mode - show interrupt instructions
+                footer_text = Text()
+                footer_text.append("Press ", style="dim")
+                footer_text.append("Ctrl+C", style="bold yellow")
+                footer_text.append(" to interrupt", style="dim")
+            else:
+                # Normal mode - show running status
+                footer_text = Text()
+                footer_text.append("Running...", style="dim")
             return Panel(footer_text, border_style="dim")
 
-    def _make_layout(self) -> Layout:
-        """Create the full TUI layout."""
-        layout = Layout()
+    def _render(self) -> Group:
+        """Create the full display."""
+        items = [self._make_env_stack()]
 
-        layout.split_column(
-            Layout(name="envs", ratio=1),
-            Layout(name="footer", size=3),
-        )
+        # Always show log panel (with placeholder lines if no logs)
+        items.append(self._make_log_panel())
 
-        layout["envs"].update(self._make_env_stack())
-        layout["footer"].update(self._make_footer())
+        # Only show footer in TUI mode
+        if self.screen:
+            items.append(self._make_footer())
 
-        return layout
-
-    def refresh(self) -> None:
-        """Refresh the display."""
-        if self._live:
-            self._live.update(self._make_layout())
-
-    async def wait_for_exit(self) -> None:
-        """Wait for user to press a key to exit."""
-        if not HAS_TERMINAL_CONTROL or not sys.stdin.isatty():
-            # on windows or non-tty, just wait for a simple input
-            await asyncio.get_event_loop().run_in_executor(None, input)
-            return
-
-        # these imports are guaranteed to exist when HAS_TERMINAL_CONTROL is true
-        import select as select_module
-        import termios as termios_module
-        import tty as tty_module
-
-        # save terminal settings
-        fd = sys.stdin.fileno()
-        old_settings = termios_module.tcgetattr(fd)
-
-        def drain_escape_sequence() -> None:
-            """Consume remaining chars of an escape sequence (mouse events, etc)."""
-            while select_module.select([sys.stdin], [], [], 0.01)[0]:
-                sys.stdin.read(1)
-
-        try:
-            # use cbreak mode (not raw) - allows single char input without corrupting display
-            tty_module.setcbreak(fd)
-
-            # wait for key press in a non-blocking way
-            while True:
-                # small delay to keep display responsive
-                await asyncio.sleep(0.1)
-
-                # use select to check for input without blocking
-                if select_module.select([sys.stdin], [], [], 0)[0]:
-                    char = sys.stdin.read(1)
-
-                    # handle escape sequences (mouse scroll, arrow keys, etc)
-                    if char == "\x1b":
-                        # check if more chars follow (escape sequence vs standalone Esc)
-                        if select_module.select([sys.stdin], [], [], 0.05)[0]:
-                            # escape sequence - drain it and ignore
-                            drain_escape_sequence()
-                            continue
-                        else:
-                            # standalone Escape key - exit
-                            break
-
-                    # exit on q, Q, or enter
-                    if char in ("q", "Q", "\r", "\n"):
-                        break
-        finally:
-            # restore terminal settings
-            termios_module.tcsetattr(fd, termios_module.TCSADRAIN, old_settings)
-
-    async def __aenter__(self) -> "EvalTUI":
-        """Start the Live display using alternate screen mode."""
-        # disable terminal echo to prevent scroll/arrow keys from displaying
-        if HAS_TERMINAL_CONTROL and sys.stdin.isatty():
-            import termios
-
-            fd = sys.stdin.fileno()
-            self._old_terminal_settings = termios.tcgetattr(fd)
-            new_settings = termios.tcgetattr(fd)
-            # disable echo (ECHO flag in lflags)
-            new_settings[3] = new_settings[3] & ~termios.ECHO
-            termios.tcsetattr(fd, termios.TCSADRAIN, new_settings)
-
-        self._live = Live(
-            self._make_layout(),
-            console=self.console,
-            refresh_per_second=4,
-            screen=True,
-        )
-        self._live.__enter__()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Stop the Live display and restore terminal settings."""
-        if self._live:
-            self._live.__exit__(exc_type, exc_val, exc_tb)
-            self._live = None
-
-        # restore terminal settings
-        if self._old_terminal_settings is not None:
-            import termios
-
-            fd = sys.stdin.fileno()
-            termios.tcsetattr(fd, termios.TCSADRAIN, self._old_terminal_settings)
-            self._old_terminal_settings = None
+        return Group(*items)
 
     def print_final_summary(self) -> None:
-        """Print a summary after the TUI closes."""
+        """Print a comprehensive summary after the display closes."""
         self.console.print()
 
-        # summary table
+        # Summary table with main metrics
         table = Table(title="Evaluation Summary")
-        table.add_column("Environment", style="cyan")
-        table.add_column("Status", justify="center")
-        table.add_column("N", justify="center")
-        table.add_column("Avg Reward", justify="center")
-        table.add_column("Time", justify="center")
+        table.add_column("env_id", style="cyan")
+        table.add_column("status", justify="center")
+        table.add_column("examples", justify="center")
+        table.add_column("rollouts", justify="center")
+        table.add_column("reward", justify="center")
+        table.add_column("errors", justify="center")
+        table.add_column("time", justify="center")
 
         for idx, config in enumerate(self.configs):
             env_state = self.state.envs[idx]
             status_styles = {
-                "completed": "[green]DONE[/green]",
-                "failed": "[red]FAILED[/red]",
-                "running": "[yellow]RUNNING[/yellow]",
-                "pending": "[dim]PENDING[/dim]",
+                "completed": "[green]done[/green]",
+                "failed": "[red]failed[/red]",
+                "running": "[yellow]running[/yellow]",
+                "pending": "[dim]pending[/dim]",
             }
             status = status_styles.get(env_state.status, env_state.status)
 
             # use env_state.total for actual resolved values
             total_rollouts = env_state.total
             num_examples = total_rollouts // config.rollouts_per_example
-            n = f"{num_examples}x{config.rollouts_per_example} ({total_rollouts} rollouts)"
+            examples_str = str(num_examples)
+            rollouts_str = str(config.rollouts_per_example)
 
             reward = f"{env_state.reward:.3f}"
+
+            # error rate with color coding
+            error_rate = env_state.error_rate
+            if error_rate > 0.10:
+                error_str = f"[red]{error_rate:.1%}[/red]"
+            elif error_rate > 0:
+                error_str = f"[yellow]{error_rate:.1%}[/yellow]"
+            else:
+                error_str = f"[green]{error_rate:.1%}[/green]"
+
             elapsed = env_state.elapsed_time
             mins, secs = divmod(int(elapsed), 60)
             time_str = f"{mins}m {secs:02d}s" if mins > 0 else f"{secs}s"
 
-            table.add_row(config.env_id, status, n, reward, time_str)
+            table.add_row(
+                config.env_id,
+                status,
+                examples_str,
+                rollouts_str,
+                reward,
+                error_str,
+                time_str,
+            )
 
         self.console.print(table)
 
-        # print save paths if any
+        # Print additional metrics if available
+        for idx, config in enumerate(self.configs):
+            env_state = self.state.envs[idx]
+            if env_state.metrics:
+                self.console.print()
+                self.console.print(f"[bold]{config.env_id}:[/bold]")
+                for name, value in env_state.metrics.items():
+                    if isinstance(value, float):
+                        value_str = f"{value:.4f}"
+                    else:
+                        value_str = str(value)
+                    self.console.print(f"  [cyan]•[/cyan] {name}: {value_str}")
+
+        # Print save paths if any
         saved_envs = [
             (idx, env_state)
             for idx, env_state in self.state.envs.items()
@@ -513,17 +458,16 @@ class EvalTUI:
             for idx, env_state in saved_envs:
                 self.console.print(f"  [cyan]•[/cyan] {env_state.save_path}")
 
-        # print errors if any
+        # Print errors if any
         for idx, config in enumerate(self.configs):
             env_state = self.state.envs[idx]
             if env_state.error:
                 self.console.print()
-                self.console.print(f"[red]Error in {config.env_id}:[/red]")
+                self.console.print(f"[red]error in {config.env_id}:[/red]")
                 self.console.print(f"  {env_state.error}")
 
         self.console.print()
 
 
-def is_tty() -> bool:
-    """Check if stdout is a TTY (terminal)."""
-    return sys.stdout.isatty()
+# Re-export is_tty for convenience
+from verifiers.utils.display_utils import is_tty  # noqa: E402, F401

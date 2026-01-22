@@ -10,13 +10,13 @@ import logging
 import os
 from pathlib import Path
 
-from gepa import optimize
+from gepa.api import optimize
 
 import verifiers as vf
 from verifiers import setup_logging
 from verifiers.gepa.adapter import VerifiersGEPAAdapter, make_reflection_lm
-from verifiers.gepa.gepa_utils import save_gepa_results
 from verifiers.gepa.display import GEPADisplay
+from verifiers.gepa.gepa_utils import save_gepa_results
 from verifiers.types import ClientConfig
 from verifiers.utils.client_utils import setup_client
 from verifiers.utils.eval_utils import load_endpoints
@@ -38,29 +38,47 @@ def main():
     # Environment (aligned with vf-eval)
     parser.add_argument("env_id", type=str, help="Environment module name")
     parser.add_argument(
-        "--env-args", "-a", type=json.loads, default={},
+        "--env-args",
+        "-a",
+        type=json.loads,
+        default={},
         help='Environment module arguments as JSON object (e.g., \'{"key": "value"}\')',
     )
     parser.add_argument(
-        "--env-dir-path", "-p", type=str, default="./environments",
+        "--env-dir-path",
+        "-p",
+        type=str,
+        default="./environments",
         help="Path to environments directory",
     )
     parser.add_argument(
-        "--extra-env-kwargs", "-x", type=json.loads, default={},
-        help='Extra environment kwargs as JSON object. Passed to environment constructor.',
+        "--extra-env-kwargs",
+        "-x",
+        type=json.loads,
+        default={},
+        help="Extra environment kwargs as JSON object. Passed to environment constructor.",
     )
 
     # Model configuration (aligned with vf-eval)
     parser.add_argument(
-        "--model", "-m", type=str, default="openai/gpt-4.1-mini",
+        "--model",
+        "-m",
+        type=str,
+        default="openai/gpt-4.1-mini",
         help="Model for evaluation rollouts",
     )
     parser.add_argument(
-        "--reflection-model", "-M", type=str, default=None,
+        "--reflection-model",
+        "-M",
+        type=str,
+        default=None,
         help="Model for reflection/teacher LLM (defaults to --model)",
     )
     parser.add_argument(
-        "--endpoints-path", "-e", type=str, default="./configs/endpoints.py",
+        "--endpoints-path",
+        "-e",
+        type=str,
+        default="./configs/endpoints.py",
         help="Path to API endpoints registry",
     )
     parser.add_argument("--api-key-var", "-k", type=str, default=None)
@@ -68,25 +86,43 @@ def main():
 
     # GEPA optimization (the key params)
     parser.add_argument(
-        "--max-calls", "-B", type=int, default=DEFAULT_MAX_METRIC_CALLS,
+        "--max-calls",
+        "-B",
+        type=int,
+        default=DEFAULT_MAX_METRIC_CALLS,
         help="Maximum metric calls (evaluation budget)",
     )
     parser.add_argument(
-        "--minibatch-size", type=int, default=DEFAULT_MINIBATCH_SIZE,
+        "--minibatch-size",
+        type=int,
+        default=DEFAULT_MINIBATCH_SIZE,
         help="Minibatch size for reflection",
     )
     parser.add_argument(
-        "--perfect-score", type=float, default=None,
+        "--perfect-score",
+        type=float,
+        default=None,
         help="If set, dont reflect on minibatches with this score",
     )
     parser.add_argument(
-        "--state-columns", type=str, nargs="*", default=[],
+        "--state-columns",
+        type=str,
+        nargs="*",
+        default=[],
         help="Additional state columns to copy to reflection dataset",
     )
 
     # Dataset sizes
-    parser.add_argument("--num-train", "-n", type=int, default=DEFAULT_NUM_TRAIN, help="Training examples")
-    parser.add_argument("--num-val", "-N", type=int, default=DEFAULT_NUM_VAL, help="Validation examples")
+    parser.add_argument(
+        "--num-train",
+        "-n",
+        type=int,
+        default=DEFAULT_NUM_TRAIN,
+        help="Training examples",
+    )
+    parser.add_argument(
+        "--num-val", "-N", type=int, default=DEFAULT_NUM_VAL, help="Validation examples"
+    )
 
     # Execution (aligned with vf-eval)
     parser.add_argument("--max-concurrent", "-c", type=int, default=32)
@@ -95,8 +131,17 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true")
 
     # Output
-    parser.add_argument("--run-dir", "-o", type=str, default=None, help="Override output directory")
+    parser.add_argument(
+        "--run-dir", "-o", type=str, default=None, help="Override output directory"
+    )
     parser.add_argument("--no-save", action="store_true", help="Disable saving results")
+    parser.add_argument(
+        "--tui",
+        "-u",
+        action="store_true",
+        default=False,
+        help="Use alternate screen mode (TUI) for display",
+    )
 
     args = parser.parse_args()
     setup_logging("DEBUG" if args.verbose else os.getenv("VF_LOG_LEVEL", "INFO"))
@@ -113,7 +158,9 @@ def main():
         model = endpoint["model"]
     else:
         api_key_var = args.api_key_var if api_key_override else DEFAULT_API_KEY_VAR
-        api_base_url = args.api_base_url if api_base_url_override else DEFAULT_API_BASE_URL
+        api_base_url = (
+            args.api_base_url if api_base_url_override else DEFAULT_API_BASE_URL
+        )
         model = args.model
 
     # Resolve reflection model and its client config
@@ -168,6 +215,7 @@ def main():
         seed=args.seed,
         run_dir=run_dir,
         save_results=save_results,
+        tui_mode=args.tui,
     )
 
 
@@ -190,83 +238,105 @@ def run_gepa_optimization(
     seed: int,
     run_dir: Path | None,
     save_results: bool,
+    tui_mode: bool = False,
 ):
-    # Load environment
-    logger.info(f"Loading environment: {env_id}")
-    env = vf.load_environment(env_id=env_id, **env_args)
-
-    if isinstance(env, vf.EnvGroup):
-        raise ValueError("GEPA is not supported for EnvGroup. Optimize each environment individually.")
-
-    # Set extra env kwargs
-    if extra_env_kwargs:
-        logger.info(f"Setting extra environment kwargs: {extra_env_kwargs}")
-        env.set_kwargs(**extra_env_kwargs)
-
-    # Check system prompt
-    initial_prompt = env.system_prompt or ""
-    if not initial_prompt:
-        logger.warning("No system prompt attached to environment.")
-        if env.message_type == "chat":
-            logger.warning("Will add a system message block to the start of chat messages.")
-        else:
-            logger.warning("Will prepend system prompt to the start of completion prompts.")
-
-    # Get datasets
-    logger.info(f"Loading trainset ({num_train} examples)")
-    trainset = env.get_dataset(n=num_train).to_list()
-
-    logger.info(f"Loading valset ({num_val} examples)")
-    valset = env.get_eval_dataset(n=num_val).to_list()
-
-    # Set up client
-    client = setup_client(client_config)
-
-    # Create run_dir
+    # Create run_dir early
     if run_dir:
         run_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Results will be saved to: {run_dir}")
 
-    # Extract valset example_ids for display
-    valset_example_ids = [item.get("example_id", i) for i, item in enumerate(valset)]
-
-    # Create display
+    # Create display with config (valset info updated after env loads)
     display = GEPADisplay(
+        env_id=env_id,
+        model=model,
+        reflection_model=reflection_model,
         max_metric_calls=max_metric_calls,
-        valset_size=len(valset),
-        valset_example_ids=valset_example_ids,
+        num_train=num_train,  # requested count, actual may differ
+        num_val=num_val,  # requested count, actual may differ
         log_file=run_dir / "gepa.log" if run_dir else None,
         perfect_score=perfect_score,
+        screen=tui_mode,
     )
 
-    # Create adapter
-    adapter = VerifiersGEPAAdapter(
-        env=env,
-        client=client,
-        model=model,
-        sampling_args=sampling_args,
-        max_concurrent=max_concurrent,
-        state_columns=state_columns,
-        display=display,
-    )
+    with display:
+        # Load environment (inside display context to suppress logs)
+        logger.debug(f"Loading environment: {env_id}")
+        env = vf.load_environment(env_id=env_id, **env_args)
 
-    # Create reflection LM
-    reflection_lm = make_reflection_lm(client_config=reflection_client_config, model=reflection_model)
+        if isinstance(env, vf.EnvGroup):
+            raise ValueError(
+                "GEPA is not supported for EnvGroup. Optimize each environment individually."
+            )
 
-    # Configure perfect score handling
-    skip_perfect_score = perfect_score is not None
+        # Set extra env kwargs
+        if extra_env_kwargs:
+            logger.info(f"Setting extra environment kwargs: {extra_env_kwargs}")
+            env.set_kwargs(**extra_env_kwargs)
 
-    # Run GEPA
-    logger.info(f"Starting GEPA optimization (budget={max_metric_calls}, minibatch={minibatch_size})")
-    logger.info(f"Eval model: {model}")
-    logger.info(f"Reflection model: {reflection_model}")
-    if perfect_score is not None:
-        logger.info(f"Perfect score: {perfect_score} (will not reflect on minibatches with perfect score)")
+        # Check system prompt
+        initial_prompt = env.system_prompt or ""
+        if not initial_prompt:
+            logger.warning("No system prompt attached to environment.")
+            if env.message_type == "chat":
+                logger.warning(
+                    "Will add a system message block to the start of chat messages."
+                )
+            else:
+                logger.warning(
+                    "Will prepend system prompt to the start of completion prompts."
+                )
 
-    seed_candidate = {"system_prompt": initial_prompt}
+        # Get datasets
+        logger.debug(f"Loading trainset ({num_train} examples)")
+        trainset = env.get_dataset(n=num_train).to_list()
 
-    display.start()
-    try:
+        logger.debug(f"Loading valset ({num_val} examples)")
+        valset = env.get_eval_dataset(n=num_val).to_list()
+
+        # Update display with actual valset info
+        valset_example_ids = [
+            item.get("example_id", i) for i, item in enumerate(valset)
+        ]
+        display.set_valset_info(len(valset), valset_example_ids)
+        # Update actual counts (may differ from requested if dataset is smaller)
+        display.num_train = len(trainset)
+        display.num_val = len(valset)
+
+        # Set up client
+        client = setup_client(client_config)
+
+        logger.debug(f"Results will be saved to: {run_dir}")
+
+        # Create adapter
+        adapter = VerifiersGEPAAdapter(
+            env=env,
+            client=client,
+            model=model,
+            sampling_args=sampling_args,
+            max_concurrent=max_concurrent,
+            state_columns=state_columns,
+            display=display,
+        )
+
+        # Create reflection LM
+        reflection_lm = make_reflection_lm(
+            client_config=reflection_client_config, model=reflection_model
+        )
+
+        # Configure perfect score handling
+        skip_perfect_score = perfect_score is not None
+
+        # Run GEPA
+        logger.debug(
+            f"Starting GEPA optimization (budget={max_metric_calls}, minibatch={minibatch_size})"
+        )
+        logger.debug(f"Eval model: {model}")
+        logger.debug(f"Reflection model: {reflection_model}")
+        if perfect_score is not None:
+            logger.debug(
+                f"Perfect score: {perfect_score} (will not reflect on minibatches with perfect score)"
+            )
+
+        seed_candidate = {"system_prompt": initial_prompt}
         optimize_kwargs: dict = {
             "seed_candidate": seed_candidate,
             "trainset": trainset,
@@ -284,35 +354,30 @@ def run_gepa_optimization(
         if perfect_score is not None:
             optimize_kwargs["perfect_score"] = perfect_score
         result = optimize(**optimize_kwargs)
-    finally:
-        display.stop()
 
-    # Save results
-    if run_dir and save_results:
-        run_config = {
-            "env_id": env_id,
-            "env_args": env_args,
-            "model": model,
-            "reflection_model": reflection_model,
-            "num_train": num_train,
-            "num_val": num_val,
-            "max_metric_calls": max_metric_calls,
-            "minibatch_size": minibatch_size,
-            "perfect_score": perfect_score,
-            "state_columns": state_columns,
-            "seed": seed,
-        }
-        save_gepa_results(run_dir, result, config=run_config)
-        logger.info(f"Results saved to {run_dir}")
+        # Save results
+        save_path = None
+        if run_dir and save_results:
+            run_config = {
+                "env_id": env_id,
+                "env_args": env_args,
+                "model": model,
+                "reflection_model": reflection_model,
+                "num_train": num_train,
+                "num_val": num_val,
+                "max_metric_calls": max_metric_calls,
+                "minibatch_size": minibatch_size,
+                "perfect_score": perfect_score,
+                "state_columns": state_columns,
+                "seed": seed,
+            }
+            save_gepa_results(run_dir, result, config=run_config)
+            save_path = str(run_dir)
+            logger.debug(f"Results saved to {run_dir}")
 
-    # Print final result
-    print("\n" + "=" * 60)
-    print("GEPA Optimization Complete")
-    print("=" * 60)
-    best_prompt = result.best_candidate.get("system_prompt", "")
-    print(f"\nBest system prompt:\n{best_prompt[:500]}{'...' if len(best_prompt) > 500 else ''}")
-    if run_dir:
-        print(f"\nResults saved to: {run_dir}")
+        # Set result info for final summary
+        best_prompt = result.best_candidate.get("system_prompt", "")
+        display.set_result(best_prompt=best_prompt, save_path=save_path)
 
     return result
 
