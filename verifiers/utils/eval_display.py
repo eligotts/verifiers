@@ -6,19 +6,24 @@ Provides a visual progress display that works in two modes:
 - TUI mode (screen=True): Alternate screen buffer with echo handling
 """
 
+import json
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
+from rich.columns import Columns
 from rich.console import Group
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 from rich.text import Text
 
-from verifiers.types import EvalConfig
+from verifiers.types import EvalConfig, GenerateOutputs
 from verifiers.utils.display_utils import BaseDisplay, make_aligned_row
+from verifiers.utils.error_utils import ErrorChain
+from verifiers.utils.message_utils import messages_to_printable
 
 
 @dataclass
@@ -45,12 +50,93 @@ class EnvEvalState:
     # log message for special events (updated by on_log callback)
     log_message: str | None = None
 
+    # full results (stored after completion for summary)
+    results: GenerateOutputs | None = None
+
     @property
     def elapsed_time(self) -> float:
         if self.start_time is None:
             return 0.0
         end = self.end_time or time.time()
         return end - self.start_time
+
+
+def _format_messages(messages: Any) -> Text:
+    """Format messages for display (similar to print_prompt_completions_sample)."""
+
+    def _attr_or_key(obj: Any, key: str, default: Any = None) -> Any:
+        val = getattr(obj, key, None)
+        if val is not None:
+            return val
+        if isinstance(obj, Mapping):
+            return obj.get(key, default)
+        return default
+
+    def _normalize_tool_call(tc: Any) -> dict[str, str]:
+        src = _attr_or_key(tc, "function") or tc
+        name = _attr_or_key(src, "name", "") or ""
+        args = _attr_or_key(src, "arguments", {}) or {}
+        if not isinstance(args, str):
+            try:
+                args = json.dumps(args)
+            except Exception:
+                args = str(args)
+        return {"name": name, "args": args}
+
+    if isinstance(messages, str):
+        return Text(messages)
+
+    out = Text()
+    for idx, msg in enumerate(messages):
+        if idx:
+            out.append("\n\n")
+
+        assert isinstance(msg, dict)
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        style = "bright_cyan" if role == "assistant" else "bright_magenta"
+
+        out.append(f"{role}: ", style="bold")
+        out.append(str(content) if content else "", style=style)
+
+        for tc in msg.get("tool_calls") or []:
+            payload = _normalize_tool_call(tc)
+            out.append(
+                "\n\n[tool call]\n" + json.dumps(payload, indent=2, ensure_ascii=False),
+                style=style,
+            )
+
+    return out
+
+
+def _make_histogram(values: list[float], bins: int = 10, width: int = 20) -> Text:
+    """Create a simple text histogram of values."""
+    if not values:
+        return Text("no data", style="dim")
+
+    min_val, max_val = min(values), max(values)
+    if min_val == max_val:
+        return Text(f"all values = {min_val:.2f}", style="dim")
+
+    bin_width = (max_val - min_val) / bins
+    counts = [0] * bins
+    for v in values:
+        bin_idx = min(int((v - min_val) / bin_width), bins - 1)
+        counts[bin_idx] += 1
+
+    max_count = max(counts)
+    out = Text()
+
+    for i, count in enumerate(counts):
+        bin_start = min_val + i * bin_width
+        bar_len = int((count / max_count) * width) if max_count > 0 else 0
+        bar = "█" * bar_len + "░" * (width - bar_len)
+
+        out.append(f"{bin_start:5.2f} ", style="dim")
+        out.append(bar, style="cyan")
+        out.append(f" {count}\n", style="dim")
+
+    return out
 
 
 @dataclass
@@ -108,6 +194,7 @@ class EvalDisplay(BaseDisplay):
         error: str | None = None,
         save_path: Path | None = None,
         log_message: str | None = None,
+        results: GenerateOutputs | None = None,
     ) -> None:
         """Update the state of a specific environment evaluation."""
         assert env_idx in self.state.envs
@@ -146,6 +233,9 @@ class EvalDisplay(BaseDisplay):
 
         if log_message is not None:
             env_state.log_message = log_message
+
+        if results is not None:
+            env_state.results = results
 
         self.refresh()
 
@@ -365,7 +455,7 @@ class EvalDisplay(BaseDisplay):
 
     def _render(self) -> Group:
         """Create the full display."""
-        items = [self._make_env_stack()]
+        items: list[Group | Panel] = [self._make_env_stack()]
 
         # Always show log panel (with placeholder lines if no logs)
         items.append(self._make_log_panel())
@@ -433,18 +523,22 @@ class EvalDisplay(BaseDisplay):
 
         self.console.print(table)
 
-        # Print additional metrics if available
+        # Per-environment detailed sections
         for idx, config in enumerate(self.configs):
             env_state = self.state.envs[idx]
-            if env_state.metrics:
-                self.console.print()
-                self.console.print(f"[bold]{config.env_id}:[/bold]")
-                for name, value in env_state.metrics.items():
-                    if isinstance(value, float):
-                        value_str = f"{value:.4f}"
-                    else:
-                        value_str = str(value)
-                    self.console.print(f"  [cyan]•[/cyan] {name}: {value_str}")
+            results = env_state.results
+
+            if results is None:
+                continue
+
+            self.console.print()
+            self.console.print(
+                Panel(
+                    self._make_env_detail(config, env_state, results),
+                    title=f"[bold blue]{config.env_id}[/bold blue]",
+                    border_style="dim",
+                )
+            )
 
         # Print save paths if any
         saved_envs = [
@@ -467,6 +561,105 @@ class EvalDisplay(BaseDisplay):
                 self.console.print(f"  {env_state.error}")
 
         self.console.print()
+
+    def _make_env_detail(
+        self, config: EvalConfig, env_state: EnvEvalState, results: GenerateOutputs
+    ) -> Group:
+        """Create detailed content for a single environment's summary."""
+        items: list[Panel] = []
+
+        # Example 0 prompt/completion
+        if results["prompt"] and results["completion"]:
+            prompt = messages_to_printable(results["prompt"][0])
+            completion = messages_to_printable(results["completion"][0])
+            reward_0 = results["reward"][0] if results["reward"] else 0.0
+            error_0 = results["state"][0].get("error") if results["state"] else None
+
+            # Prompt panel
+            items.append(
+                Panel(
+                    _format_messages(prompt),
+                    title="[dim]example 0 — prompt[/dim]",
+                    border_style="dim",
+                )
+            )
+
+            # Completion panel (with error if any)
+            completion_text = _format_messages(completion)
+            if error_0 is not None:
+                completion_text.append("\n\nerror: ", style="bold red")
+                completion_text.append(str(ErrorChain(error_0)), style="bold red")
+            completion_text.append("\n\nreward: ", style="bold cyan")
+            completion_text.append(f"{reward_0:.3f}", style="bold cyan")
+
+            items.append(
+                Panel(
+                    completion_text,
+                    title="[dim]example 0 — completion[/dim]",
+                    border_style="dim",
+                )
+            )
+
+        # Reward distribution
+        rewards = results["reward"]
+        if rewards:
+            # All rollouts histogram
+            all_rollouts_content = Group(
+                Text("all rollouts:", style="bold"),
+                _make_histogram(rewards, bins=8, width=25),
+            )
+
+            # Per-example averages if multiple rollouts
+            rollouts_per = config.rollouts_per_example
+            if rollouts_per > 1 and len(rewards) >= rollouts_per:
+                num_examples = len(rewards) // rollouts_per
+                example_avgs = []
+                for i in range(num_examples):
+                    example_rewards = rewards[i * rollouts_per : (i + 1) * rollouts_per]
+                    example_avgs.append(sum(example_rewards) / len(example_rewards))
+
+                per_example_content = Group(
+                    Text("per-example avg:", style="bold"),
+                    _make_histogram(example_avgs, bins=8, width=25),
+                )
+
+                # Side by side
+                reward_display = Columns(
+                    [all_rollouts_content, per_example_content],
+                    equal=True,
+                    expand=True,
+                )
+            else:
+                reward_display = all_rollouts_content
+
+            items.append(
+                Panel(
+                    reward_display,
+                    title="[dim]reward distribution[/dim]",
+                    border_style="dim",
+                )
+            )
+
+        # Metrics
+        if env_state.metrics:
+            metrics_text = Text()
+            for name, value in env_state.metrics.items():
+                if isinstance(value, float):
+                    value_str = f"{value:.4f}"
+                else:
+                    value_str = str(value)
+                metrics_text.append(f"• {name}: ", style="cyan")
+                metrics_text.append(f"{value_str}\n")
+
+            items.append(
+                Panel(
+                    metrics_text,
+                    title="[dim]metrics (avg)[/dim]",
+                    border_style="dim",
+                )
+            )
+
+        return Group(*items)
 
 
 # Re-export is_tty for convenience

@@ -450,6 +450,7 @@ async def run_evaluations_tui(config: EvalRunConfig, tui_mode: bool = True) -> N
                 env_idx,
                 status="completed",
                 save_path=save_path,
+                results=result,
             )
 
             return result

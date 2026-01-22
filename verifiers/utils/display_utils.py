@@ -159,7 +159,7 @@ class BaseDisplay:
             console=self.console,
             refresh_per_second=self.refresh_per_second,
             screen=self.screen,
-            transient=not self.screen,  # Clear display when done in non-TUI mode
+            transient=False,  # Keep final display visible in scrollback
             vertical_overflow="visible",
         )
         self._live.start()
