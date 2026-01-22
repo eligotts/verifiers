@@ -45,7 +45,7 @@ dependencies = [
     "tomli; python_version < '3.11'",
     "typing_extensions; python_version < '3.12'",
     "wget>=3.2",
-    "gepa"
+    "gepa",
 ]
 
 [tool.uv.sources]
