@@ -16,7 +16,7 @@ import sys
 from collections import deque
 from typing import Any
 
-from datasets import disable_progress_bar
+from datasets import disable_progress_bar, enable_progress_bar
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
@@ -169,6 +169,9 @@ class BaseDisplay:
         if self._live:
             self._live.stop()
             self._live = None
+
+        # Restore datasets progress bar
+        enable_progress_bar()
 
         # Remove our log handler and restore original handler levels
         logger = logging.getLogger("verifiers")
