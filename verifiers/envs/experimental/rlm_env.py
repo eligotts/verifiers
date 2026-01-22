@@ -3301,6 +3301,13 @@ class RLMEnv(vf.StatefulToolEnv):
             # Subsequent turns: use parent implementation
             return await super().get_prompt_messages(state)
 
+    async def env_response(self, messages: Messages, state: State, **kwargs) -> Messages:
+      """Override to set final_env_response when answer is ready to avoid extra model call"""
+      tool_messages = await super().env_response(messages, state, **kwargs)
+      if "final_answer" in state:                                                                                                                       
+          state["final_env_response"] = tool_messages                                                                                                                                         
+      return tool_messages
+
     # =========================================================================
     # Stop Conditions
     # =========================================================================
