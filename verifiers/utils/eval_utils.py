@@ -307,8 +307,8 @@ async def run_evaluation(
 
     # run evaluation
     results_path = get_eval_results_path(config)
-    logger.info(f"Starting evaluation with model: {config.model}")
-    logger.info(
+    logger.debug(f"Starting evaluation with model: {config.model}")
+    logger.debug(
         f"Configuration: num_examples={config.num_examples}, rollouts_per_example={config.rollouts_per_example}, max_concurrent={config.max_concurrent}"
     )
     # disable tqdm when callbacks are provided (TUI handles progress display)
@@ -368,115 +368,115 @@ async def run_evaluations(config: EvalRunConfig) -> None:
         )
 
 
-async def run_evaluations_tui(config: EvalRunConfig) -> None:
-    """Run multi-environment evaluation with a TUI display."""
+async def run_evaluations_tui(config: EvalRunConfig, tui_mode: bool = True) -> None:
+    """Run multi-environment evaluation with a Rich display.
 
-    from verifiers.utils.eval_tui import EvalTUI, is_tty
+    Args:
+        config: Evaluation run configuration.
+        tui_mode: If True, use alternate screen (--tui flag). If False, refresh in-place.
+    """
+    from verifiers.utils.eval_display import EvalDisplay, is_tty
 
-    # fall back to non-tui mode if not a tty
+    # fall back to non-display mode if not a tty
     if not is_tty():
-        logger.info("Not a TTY, falling back to standard output")
+        logger.debug("Not a TTY, falling back to standard output")
         await run_evaluations(config)
         return
 
-    # critical level to suppress logging
-    with vf.log_level(logging.CRITICAL):
-        tui = EvalTUI(config.evals)
+    display = EvalDisplay(config.evals, screen=tui_mode)
 
-        async def run_with_progress(
-            env_config: EvalConfig, env_idx: int
-        ) -> GenerateOutputs:
-            """Run a single evaluation with TUI progress updates."""
-            reward_accum = 0
-            metrics_accum = defaultdict(float)
-            error_accum = 0
+    async def run_with_progress(
+        env_config: EvalConfig, env_idx: int
+    ) -> GenerateOutputs:
+        """Run a single evaluation with display progress updates."""
+        reward_accum = 0
+        metrics_accum = defaultdict(float)
+        error_accum = 0
 
-            def on_start(total: int) -> None:
-                # total is num_examples * rollouts_per_example
-                # compute actual num_examples (resolves -1 to actual count)
-                num_examples = total // env_config.rollouts_per_example
-                tui.update_env_state(env_idx, total=total, num_examples=num_examples)
+        def on_start(total: int) -> None:
+            # total is num_examples * rollouts_per_example
+            # compute actual num_examples (resolves -1 to actual count)
+            num_examples = total // env_config.rollouts_per_example
+            display.update_env_state(env_idx, total=total, num_examples=num_examples)
 
-            def on_progress(all_states: list[State], new_states: list[State]) -> None:
-                nonlocal error_accum, reward_accum, metrics_accum
+        def on_progress(all_states: list[State], new_states: list[State]) -> None:
+            nonlocal error_accum, reward_accum, metrics_accum
 
-                # Progress is always rollout-based
-                completed = len(all_states)
+            # Progress is always rollout-based
+            completed = len(all_states)
 
-                for s in new_states:
-                    if s.get("error") is not None:
-                        error_accum += 1
-                    reward = s.get("reward")
-                    if reward is not None:
-                        reward_accum += reward
-                    state_metrics = s.get("metrics") or {}
-                    for name, value in state_metrics.items():
-                        if value is not None:
-                            metrics_accum[name] += value
+            for s in new_states:
+                if s.get("error") is not None:
+                    error_accum += 1
+                reward = s.get("reward")
+                if reward is not None:
+                    reward_accum += reward
+                state_metrics = s.get("metrics") or {}
+                for name, value in state_metrics.items():
+                    if value is not None:
+                        metrics_accum[name] += value
 
-                # Compute averages over completed rollouts
-                reward = reward_accum / completed
-                metrics = {
-                    name: metrics_accum[name] / completed for name in metrics_accum
-                }
-                error_rate = error_accum / completed
+            # Compute averages over completed rollouts
+            reward = reward_accum / completed
+            metrics = {name: metrics_accum[name] / completed for name in metrics_accum}
+            error_rate = error_accum / completed
 
-                tui.update_env_state(
-                    env_idx,
-                    progress=completed,
-                    reward=reward,
-                    metrics=metrics,
-                    error_rate=error_rate,
-                )
+            display.update_env_state(
+                env_idx,
+                progress=completed,
+                reward=reward,
+                metrics=metrics,
+                error_rate=error_rate,
+            )
 
-            def on_log(message: str) -> None:
-                tui.update_env_state(env_idx, log_message=message)
+        def on_log(message: str) -> None:
+            display.update_env_state(env_idx, log_message=message)
 
-            tui.update_env_state(env_idx, status="running")
-            try:
-                result = await run_evaluation(
-                    env_config,
-                    on_start=on_start,
-                    on_progress=on_progress,
-                    on_log=on_log,
-                )
-
-                # get save path if results were saved
-                save_path = (
-                    result["metadata"]["path_to_save"]
-                    if env_config.save_results
-                    else None
-                )
-
-                tui.update_env_state(
-                    env_idx,
-                    status="completed",
-                    save_path=save_path,
-                )
-
-                return result
-            except Exception as e:
-                tui.update_env_state(env_idx, status="failed", error=str(e))
-                raise
-
+        display.update_env_state(env_idx, status="running")
         try:
-            async with tui:
-                await asyncio.gather(
-                    *[
-                        run_with_progress(env_config, idx)
-                        for idx, env_config in enumerate(config.evals)
-                    ],
-                    return_exceptions=True,
-                )
+            result = await run_evaluation(
+                env_config,
+                on_start=on_start,
+                on_progress=on_progress,
+                on_log=on_log,
+            )
 
-                tui.refresh()
-                await tui.wait_for_exit()
+            # get save path if results were saved
+            save_path = (
+                result["metadata"]["path_to_save"] if env_config.save_results else None
+            )
 
-        except KeyboardInterrupt:
-            pass  # exit on interrupt
+            display.update_env_state(
+                env_idx,
+                status="completed",
+                save_path=save_path,
+                results=result,
+            )
 
-        # print final summary after exit
-        tui.print_final_summary()
+            return result
+        except Exception as e:
+            display.update_env_state(env_idx, status="failed", error=str(e))
+            raise
+
+    try:
+        async with display:
+            await asyncio.gather(
+                *[
+                    run_with_progress(env_config, idx)
+                    for idx, env_config in enumerate(config.evals)
+                ],
+                return_exceptions=True,
+            )
+
+            display.refresh()
+            if tui_mode:
+                await display.wait_for_exit()
+
+    except KeyboardInterrupt:
+        pass  # exit on interrupt
+
+    # print final summary after exit
+    display.print_final_summary()
 
 
 def sanitize_metadata(metadata: GenerateMetadata) -> dict:

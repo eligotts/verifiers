@@ -1,9 +1,13 @@
+import os
+
+# Suppress tokenizers parallelism warning (only prints when env var is unset)
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+
 import argparse
 import asyncio
 import importlib.resources
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +21,6 @@ from verifiers.types import ClientConfig, EvalConfig, EvalRunConfig
 from verifiers.utils.eval_utils import (
     load_endpoints,
     load_toml_config,
-    run_evaluations,
     run_evaluations_tui,
 )
 from verifiers.utils.install_utils import check_hub_env_installed
@@ -431,10 +434,8 @@ def main():
         logger.debug(f"Evaluation config: {config.model_dump_json(indent=2)}")
 
     eval_run_config = EvalRunConfig(evals=eval_configs)
-    if args.tui:
-        asyncio.run(run_evaluations_tui(eval_run_config))
-    else:
-        asyncio.run(run_evaluations(eval_run_config))
+    # Always use Rich display; --tui flag controls screen mode (alternate screen vs in-place)
+    asyncio.run(run_evaluations_tui(eval_run_config, tui_mode=args.tui))
 
 
 if __name__ == "__main__":
