@@ -819,6 +819,20 @@ class Environment(ABC):
             len(all_states) // num_unique_examples if num_unique_examples > 0 else 1
         )
 
+        def _tools_key(tools: list | None) -> str:
+            if not tools:
+                return ""
+            return str(sorted([t.get("function", {}).get("name", "") for t in tools]))
+
+        all_tools = [state.get("oai_tools") for state in all_states]
+        unique_tool_sets = set(_tools_key(t) for t in all_tools)
+        tools_vary = len(unique_tool_sets) > 1
+
+        if tools_vary:
+            metadata_tools = None
+        else:
+            metadata_tools = next((t for t in all_tools if t), self.oai_tools)
+
         metadata = GenerateMetadata(
             env_id=self.env_id,
             env_args=self.env_args,
@@ -836,6 +850,7 @@ class Environment(ABC):
             },
             state_columns=state_columns or [],
             path_to_save=path_to_save,
+            tools=metadata_tools,
         )
 
         return GenerateOutputs(
