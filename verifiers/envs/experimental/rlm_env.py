@@ -51,10 +51,9 @@ else:
     from typing import TypedDict
 
 from aiohttp import web
-from openai.types.chat import ChatCompletion
+from openai.types.chat import ChatCompletion, ChatCompletionFunctionToolParam
 from prime_tunnel import Tunnel
 import verifiers as vf
-from verifiers.rubrics.rubric import Rubric
 from verifiers.types import (
     ChatMessage,
     ChatMessages,
@@ -317,70 +316,39 @@ def _update_root_tool_metrics(state: State, tool_name: str) -> None:
 
 
 class RLMMonitorRubric(vf.Rubric):
+    _SIMPLE_METRICS = [
+        "sub_llm_call_count",
+        "sub_llm_total_turns",
+        "sub_llm_prompt_tokens",
+        "sub_llm_completion_tokens",
+        "sub_llm_total_tool_calls",
+        "sub_llm_batch_count",
+        "sub_llm_max_batch_size",
+        "sub_llm_mean_batch_size",
+        "main_rlm_turns",
+        "main_rlm_prompt_tokens",
+        "main_rlm_completion_tokens",
+        "repl_total_time_seconds",
+        "repl_call_count",
+        "repl_mean_time_seconds",
+        "root_tool_call_count",
+    ]
+
     def __init__(self, root_tool_names: list[str] | None = None, **kwargs):
         super().__init__(**kwargs)
-        self.add_metric(self.sub_llm_call_count)
-        self.add_metric(self.sub_llm_total_turns)
-        self.add_metric(self.sub_llm_prompt_tokens)
-        self.add_metric(self.sub_llm_completion_tokens)
-        self.add_metric(self.sub_llm_total_tool_calls)
-        self.add_metric(self.sub_llm_batch_count)
-        self.add_metric(self.sub_llm_max_batch_size)
-        self.add_metric(self.sub_llm_mean_batch_size)
-        self.add_metric(self.main_rlm_turns)
-        self.add_metric(self.main_rlm_prompt_tokens)
-        self.add_metric(self.main_rlm_completion_tokens)
-        self.add_metric(self.repl_total_time_seconds)
-        self.add_metric(self.repl_call_count)
-        self.add_metric(self.repl_mean_time_seconds)
-        self.add_metric(self.root_tool_call_count)
+        for metric_name in self._SIMPLE_METRICS:
+            metric_fn = self._make_state_metric(metric_name)
+            setattr(self, metric_name, metric_fn)
+            self.add_metric(metric_fn)
         for tool_name in root_tool_names or []:
             self.add_metric(self._make_root_tool_metric(tool_name))
 
-    async def sub_llm_call_count(self, state: State) -> int:
-        return state["sub_llm_call_count"]
+    def _make_state_metric(self, key: str):
+        async def metric(state: State):
+            return state[key]
 
-    async def sub_llm_total_turns(self, state: State) -> int:
-        return state["sub_llm_total_turns"]
-
-    async def sub_llm_prompt_tokens(self, state: State) -> int:
-        return state["sub_llm_prompt_tokens"]
-
-    async def sub_llm_completion_tokens(self, state: State) -> int:
-        return state["sub_llm_completion_tokens"]
-
-    async def sub_llm_total_tool_calls(self, state: State) -> int:
-        return state["sub_llm_total_tool_calls"]
-
-    async def sub_llm_batch_count(self, state: State) -> int:
-        return state["sub_llm_batch_count"]
-
-    async def sub_llm_max_batch_size(self, state: State) -> int:
-        return state["sub_llm_max_batch_size"]
-
-    async def sub_llm_mean_batch_size(self, state: State) -> float:
-        return state["sub_llm_mean_batch_size"]
-
-    async def main_rlm_turns(self, state: State) -> int:
-        return state["main_rlm_turns"]
-
-    async def main_rlm_prompt_tokens(self, state: State) -> int:
-        return state["main_rlm_prompt_tokens"]
-
-    async def main_rlm_completion_tokens(self, state: State) -> int:
-        return state["main_rlm_completion_tokens"]
-
-    async def repl_total_time_seconds(self, state: State) -> float:
-        return state["repl_total_time_seconds"]
-
-    async def repl_call_count(self, state: State) -> int:
-        return state["repl_call_count"]
-
-    async def repl_mean_time_seconds(self, state: State) -> float:
-        return state["repl_mean_time_seconds"]
-
-    async def root_tool_call_count(self, state: State) -> int:
-        return state["root_tool_call_count"]
+        metric.__name__ = key
+        return metric
 
     def _make_root_tool_metric(self, tool_name: str):
         async def root_tool_metric(state: State) -> int:
@@ -413,30 +381,9 @@ class SubLLMResult(TypedDict):
 
 # Worker script that runs locally - handles code execution only
 # The REPL loop is managed by the framework, not this script
-_RLM_WORKER_SCRIPT_TEMPLATE = textwrap.dedent(
-    """
-    import ast
-    import base64
-    import contextlib
-    import io
-    import json
-    import os
-    import pickle
-    import sys
-    import sysconfig
-    import time
-    import traceback
-    from pathlib import Path
-    import requests
-
-    {filesystem_jail_code}
-
-    COMMAND_FIFO = "{command_fifo}"
-    RESPONSE_FIFO = "{response_fifo}"
-    READY_FLAG = "{ready_flag}"
-    CONTEXT_FILE = "{context_file}"
-    ANSWER_FILE = "{answer_file}"
-
+_LOCAL_SUB_LLM_CONFIG_BLOCK = (
+    textwrap.dedent(
+        """
     # Sub-LLM configuration from environment
     INTERCEPTION_URL = os.environ.get("RLM_INTERCEPTION_URL", "")
     SUB_MODEL = os.environ.get("RLM_SUB_MODEL", "")
@@ -446,7 +393,15 @@ _RLM_WORKER_SCRIPT_TEMPLATE = textwrap.dedent(
     SUB_LLM_STAGGER_JITTER_MS = int(
         os.environ.get("RLM_SUB_LLM_STAGGER_JITTER_MS", "0")
     )
+    """
+    )
+    .strip("\n")
+    .splitlines()
+)
 
+_LOCAL_GUARDRAILS_BLOCK = (
+    textwrap.dedent(
+        """
     # Guardrails for user code execution (best-effort, not an OS sandbox)
     def _parse_disallowed(raw: str) -> list[str]:
         if not raw:
@@ -488,180 +443,302 @@ _RLM_WORKER_SCRIPT_TEMPLATE = textwrap.dedent(
             restricted.pop(builtin_name, None)
 
         return restricted
-
-    def ensure_fifo(path: str) -> None:
-        if os.path.exists(path):
-            os.remove(path)
-        os.mkfifo(path)
-
-    for fifo_path in (COMMAND_FIFO, RESPONSE_FIFO):
-        ensure_fifo(fifo_path)
-
-    # Load filesystem context from file (written by setup_state)
-    fs_root = None
-    fs_metadata = {{}}
-    allowed_paths = []
-    def _get_stdlib_paths() -> list:
-        paths = []
-        try:
-            config_paths = sysconfig.get_paths()
-        except Exception:
-            return paths
-        for key in ("stdlib", "platstdlib"):
-            value = config_paths.get(key)
-            if value:
-                paths.append(value)
-        return paths
-
-    if Path(CONTEXT_FILE).exists():
-        with open(CONTEXT_FILE, "r", encoding="utf-8") as f:
-            context = json.load(f)
-            fs_root = context.get("fs_root")
-            fs_metadata = context.get("fs_metadata") or {{}}
-            allowed_paths = context.get("allowed_paths") or []
-            for stdlib_path in _get_stdlib_paths():
-                if stdlib_path not in allowed_paths:
-                    allowed_paths.append(stdlib_path)
-
-    if fs_root:
-        os.chdir(fs_root)
-        jail = FilesystemJail(
-            fs_root,
-            allowed_paths=allowed_paths,
-            disallowed_modules=DISALLOWED_MODULES,
-            disallowed_builtins=DISALLOWED_BUILTINS,
-        )
-        jail.install()
-
-    # Initialize answer structure
-    answer = {{"ready": False, "content": ""}}
-    if Path(ANSWER_FILE).exists():
-        with open(ANSWER_FILE, "r", encoding="utf-8") as f:
-            answer = json.load(f)
-
-    ROOT_TOOL_URL = os.environ.get("RLM_ROOT_TOOL_URL", "")
-    ROOT_TOOL_SERIALIZATION = os.environ.get("RLM_ROOT_TOOL_SERIALIZATION", "pickle")
-    ROOT_TOOL_NAMES_RAW = os.environ.get("RLM_ROOT_TOOL_NAMES", "[]")
-    try:
-        ROOT_TOOL_NAMES = json.loads(ROOT_TOOL_NAMES_RAW)
-    except Exception:
-        ROOT_TOOL_NAMES = []
-
-    def _call_root_tool(tool_name: str, args: tuple, kwargs: dict):
-        if not ROOT_TOOL_URL:
-            raise RuntimeError("Root tool URL not configured")
-        if ROOT_TOOL_SERIALIZATION != "pickle":
-            raise RuntimeError("Only pickle serialization is supported")
-
-        args_payload = base64.b64encode(pickle.dumps(args)).decode("ascii")
-        kwargs_payload = base64.b64encode(pickle.dumps(kwargs)).decode("ascii")
-        payload = {{
-            "tool_name": tool_name,
-            "serialization": "pickle",
-            "args": args_payload,
-            "kwargs": kwargs_payload,
-        }}
-
-        resp = requests.post(
-            ROOT_TOOL_URL,
-            json=payload,
-            timeout=SUB_LLM_TIMEOUT,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("print_lines"):
-            for line in data["print_lines"]:
-                print(line)
-        if data.get("error"):
-            raise RuntimeError(data["error"])
-        return pickle.loads(base64.b64decode(data.get("result", "")))
-
-    def _make_root_tool(name: str):
-        def _tool(*args, **kwargs):
-            return _call_root_tool(name, args, kwargs)
-
-        _tool.__name__ = name
-        return _tool
-
-    restricted_builtins = _build_restricted_builtins()
-    extra_data = fs_root
-
-    # Persistent execution namespace
-    namespace: dict[str, object] = {{
-        "__name__": "__main__",
-        "__builtins__": restricted_builtins,
-        "extra_data": extra_data,
-        "fs_metadata": fs_metadata,
-        "answer": answer,
-    }}
-    for tool_name in ROOT_TOOL_NAMES:
-        namespace[tool_name] = _make_root_tool(tool_name)
-
-    # Signal ready
-    Path(READY_FLAG).write_text("ready", encoding="utf-8")
-
-    execution_count = 0
-
-    while True:
-        with open(COMMAND_FIFO, "r", encoding="utf-8") as command_file:
-            payload = command_file.read()
-        if not payload:
-            continue
-        request = json.loads(payload)
-        if request.get("shutdown"):
-            break
-        
-        code = request.get("code", "")
-        seq = request.get("seq", 0)  # Sequence number for request/response matching
-        execution_count += 1
-        
-        result = {{
-            "status": "ok",
-            "stdout": "",
-            "stderr": "",
-            "result": None,
-            "execution_count": execution_count,
-            "seq": seq,  # Echo back sequence number for framework to verify
-            "answer": namespace.get("answer", {{"ready": False, "content": ""}}),
-        }}
-        
-        stdout_buffer = io.StringIO()
-        stderr_buffer = io.StringIO()
-        
-        try:
-            with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
-                module_ast = ast.parse(code, mode="exec")
-                body = list(module_ast.body)
-                trailing_expr = None
-                if body and isinstance(body[-1], ast.Expr):
-                    trailing_expr = body.pop()
-                if body:
-                    exec_module = ast.Module(body=body, type_ignores=[])
-                    exec(compile(exec_module, "<cell>", "exec"), namespace, namespace)
-                if trailing_expr is not None:
-                    value = eval(
-                        compile(ast.Expression(trailing_expr.value), "<cell>", "eval"),
-                        namespace,
-                        namespace,
-                    )
-                    if value is not None:
-                        result["result"] = repr(value)
-        except Exception:
-            result["status"] = "error"
-            result["result"] = traceback.format_exc()
-        
-        result["stdout"] = stdout_buffer.getvalue()
-        result["stderr"] = stderr_buffer.getvalue()
-        result["answer"] = namespace.get("answer", {{"ready": False, "content": ""}})
-        
-        # Save answer to file for persistence
-        with open(ANSWER_FILE, "w", encoding="utf-8") as f:
-            json.dump(result["answer"], f)
-        
-        with open(RESPONSE_FIFO, "w", encoding="utf-8") as response_file:
-            response_file.write(json.dumps(result))
     """
+    )
+    .strip("\n")
+    .splitlines()
 )
+
+_ENSURE_FIFO_BLOCK = [
+    "def ensure_fifo(path: str) -> None:",
+    "    if os.path.exists(path):",
+    "        os.remove(path)",
+    "    os.mkfifo(path)",
+    "",
+    "for fifo_path in (COMMAND_FIFO, RESPONSE_FIFO):",
+    "    ensure_fifo(fifo_path)",
+]
+
+_LOCAL_FS_CONTEXT_BLOCK = [
+    "fs_root = None",
+    "fs_metadata = {{}}",
+    "allowed_paths = []",
+    "def _get_stdlib_paths() -> list:",
+    "    paths = []",
+    "    try:",
+    "        config_paths = sysconfig.get_paths()",
+    "    except Exception:",
+    "        return paths",
+    '    for key in ("stdlib", "platstdlib"):',
+    "        value = config_paths.get(key)",
+    "        if value:",
+    "            paths.append(value)",
+    "    return paths",
+    "",
+    "if Path(CONTEXT_FILE).exists():",
+    '    with open(CONTEXT_FILE, "r", encoding="utf-8") as f:',
+    "        context = json.load(f)",
+    '        fs_root = context.get("fs_root")',
+    '        fs_metadata = context.get("fs_metadata") or {{}}',
+    '        allowed_paths = context.get("allowed_paths") or []',
+    "        for stdlib_path in _get_stdlib_paths():",
+    "            if stdlib_path not in allowed_paths:",
+    "                allowed_paths.append(stdlib_path)",
+]
+
+_SANDBOX_FS_CONTEXT_BLOCK = [
+    "fs_root = None",
+    "fs_metadata = {}",
+    "if Path(CONTEXT_FILE).exists():",
+    '    with open(CONTEXT_FILE, "r", encoding="utf-8") as f:',
+    "        context = json.load(f)",
+    '        fs_root = context.get("fs_root")',
+    '        fs_metadata = context.get("fs_metadata") or {}',
+]
+
+_LOCAL_JAIL_BLOCK = [
+    "    jail = FilesystemJail(",
+    "        fs_root,",
+    "        allowed_paths=allowed_paths,",
+    "        disallowed_modules=DISALLOWED_MODULES,",
+    "        disallowed_builtins=DISALLOWED_BUILTINS,",
+    "    )",
+    "    jail.install()",
+]
+
+
+def _build_python_worker_script_template(*, sandboxed: bool) -> str:
+    dict_open = "{" if sandboxed else "{{"
+    dict_close = "}" if sandboxed else "}}"
+    answer_default = f'{dict_open}"ready": False, "content": ""{dict_close}'
+    lines: list[str] = [
+        "",
+        "import ast",
+        "import base64",
+        "import contextlib",
+        "import io",
+        "import json",
+        "import os",
+        "import pickle",
+        "import sys",
+    ]
+
+    if not sandboxed:
+        lines.extend(["import sysconfig", "import time"])
+    lines.extend(
+        ["import traceback", "from pathlib import Path", "import requests", ""]
+    )
+
+    if not sandboxed:
+        lines.append("{filesystem_jail_code}")
+        lines.append("")
+
+    lines.extend(
+        [
+            'COMMAND_FIFO = "{command_fifo}"',
+            'RESPONSE_FIFO = "{response_fifo}"',
+            'READY_FLAG = "{ready_flag}"',
+            'CONTEXT_FILE = "{context_file}"',
+            'ANSWER_FILE = "{answer_file}"',
+            "",
+        ]
+    )
+
+    if not sandboxed:
+        lines.extend(_LOCAL_SUB_LLM_CONFIG_BLOCK)
+        lines.append("")
+        lines.extend(_LOCAL_GUARDRAILS_BLOCK)
+        lines.append("")
+
+    lines.extend(_ENSURE_FIFO_BLOCK)
+    lines.append("")
+    if not sandboxed:
+        lines.append("# Load filesystem context from file (written by setup_state)")
+        lines.extend(_LOCAL_FS_CONTEXT_BLOCK)
+    else:
+        lines.extend(_SANDBOX_FS_CONTEXT_BLOCK)
+    lines.append("")
+    lines.extend(["if fs_root:", "    os.chdir(fs_root)"])
+    if not sandboxed:
+        lines.extend(_LOCAL_JAIL_BLOCK)
+    lines.append("")
+    if not sandboxed:
+        lines.append("# Initialize answer structure")
+    lines.append(f"answer = {answer_default}")
+    lines.extend(
+        [
+            "if Path(ANSWER_FILE).exists():",
+            '    with open(ANSWER_FILE, "r", encoding="utf-8") as f:',
+            "        answer = json.load(f)",
+            "",
+            'ROOT_TOOL_URL = os.environ.get("RLM_ROOT_TOOL_URL", "")',
+            'ROOT_TOOL_SERIALIZATION = os.environ.get("RLM_ROOT_TOOL_SERIALIZATION", "pickle")',
+            'ROOT_TOOL_NAMES_RAW = os.environ.get("RLM_ROOT_TOOL_NAMES", "[]")',
+            "try:",
+            "    ROOT_TOOL_NAMES = json.loads(ROOT_TOOL_NAMES_RAW)",
+            "except Exception:",
+            "    ROOT_TOOL_NAMES = []",
+            "",
+            "def _call_root_tool(tool_name: str, args: tuple, kwargs: dict):",
+            "    if not ROOT_TOOL_URL:",
+            '        raise RuntimeError("Root tool URL not configured")',
+            '    if ROOT_TOOL_SERIALIZATION != "pickle":',
+            '        raise RuntimeError("Only pickle serialization is supported")',
+            "",
+            '    args_payload = base64.b64encode(pickle.dumps(args)).decode("ascii")',
+            '    kwargs_payload = base64.b64encode(pickle.dumps(kwargs)).decode("ascii")',
+            f"    payload = {dict_open}",
+            '        "tool_name": tool_name,',
+            '        "serialization": "pickle",',
+            '        "args": args_payload,',
+            '        "kwargs": kwargs_payload,',
+            f"    {dict_close}",
+            "",
+            "    resp = requests.post(",
+            "        ROOT_TOOL_URL,",
+            "        json=payload,",
+            f"        timeout={'300' if sandboxed else 'SUB_LLM_TIMEOUT'},",
+            "    )",
+            "    resp.raise_for_status()",
+            "    data = resp.json()",
+            '    if data.get("print_lines"):',
+            '        for line in data["print_lines"]:',
+            "            print(line)",
+            '    if data.get("error"):',
+            '        raise RuntimeError(data["error"])',
+            '    return pickle.loads(base64.b64decode(data.get("result", "")))',
+            "",
+            "def _make_root_tool(name: str):",
+            "    def _tool(*args, **kwargs):",
+            "        return _call_root_tool(name, args, kwargs)",
+            "",
+            "    _tool.__name__ = name",
+            "    return _tool",
+            "",
+        ]
+    )
+
+    if not sandboxed:
+        lines.append("restricted_builtins = _build_restricted_builtins()")
+    lines.append("extra_data = fs_root")
+    lines.append("")
+    if not sandboxed:
+        lines.append("# Persistent execution namespace")
+    lines.append(f"namespace: dict[str, object] = {dict_open}")
+    lines.extend(
+        [
+            '    "__name__": "__main__",',
+        ]
+    )
+    if not sandboxed:
+        lines.append('    "__builtins__": restricted_builtins,')
+    lines.extend(
+        [
+            '    "extra_data": extra_data,',
+            '    "fs_metadata": fs_metadata,',
+            '    "answer": answer,',
+            f"{dict_close}",
+            "for tool_name in ROOT_TOOL_NAMES:",
+            "    namespace[tool_name] = _make_root_tool(tool_name)",
+            "",
+        ]
+    )
+    if not sandboxed:
+        lines.append("# Signal ready")
+    lines.append('Path(READY_FLAG).write_text("ready", encoding="utf-8")')
+    lines.extend(
+        [
+            "",
+            "execution_count = 0",
+            "",
+            "while True:",
+            '    with open(COMMAND_FIFO, "r", encoding="utf-8") as command_file:',
+            "        payload = command_file.read()",
+            "    if not payload:",
+            "        continue",
+            "    request = json.loads(payload)",
+            '    if request.get("shutdown"):',
+            "        break",
+            "",
+            '    code = request.get("code", "")',
+        ]
+    )
+    if not sandboxed:
+        lines.append(
+            '    seq = request.get("seq", 0)  # Sequence number for request/response matching'
+        )
+    else:
+        lines.append('    seq = request.get("seq", 0)')
+    lines.extend(
+        [
+            "    execution_count += 1",
+            "",
+            f"    result = {dict_open}",
+            '        "status": "ok",',
+            '        "stdout": "",',
+            '        "stderr": "",',
+            '        "result": None,',
+            '        "execution_count": execution_count,',
+        ]
+    )
+    if not sandboxed:
+        lines.append(
+            '        "seq": seq,  # Echo back sequence number for framework to verify'
+        )
+    else:
+        lines.append('        "seq": seq,')
+    lines.extend(
+        [
+            f'        "answer": namespace.get("answer", {answer_default}),',
+            f"    {dict_close}",
+            "",
+            "    stdout_buffer = io.StringIO()",
+            "    stderr_buffer = io.StringIO()",
+            "",
+            "    try:",
+            "        with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):",
+            '            module_ast = ast.parse(code, mode="exec")',
+            "            body = list(module_ast.body)",
+            "            trailing_expr = None",
+            "            if body and isinstance(body[-1], ast.Expr):",
+            "                trailing_expr = body.pop()",
+            "            if body:",
+            "                exec_module = ast.Module(body=body, type_ignores=[])",
+            '                exec(compile(exec_module, "<cell>", "exec"), namespace, namespace)',
+            "            if trailing_expr is not None:",
+            "                value = eval(",
+            '                    compile(ast.Expression(trailing_expr.value), "<cell>", "eval"),',
+            "                    namespace,",
+            "                    namespace,",
+            "                )",
+            "                if value is not None:",
+            '                    result["result"] = repr(value)',
+            "    except Exception:",
+            '        result["status"] = "error"',
+            '        result["result"] = traceback.format_exc()',
+            "",
+            '    result["stdout"] = stdout_buffer.getvalue()',
+            '    result["stderr"] = stderr_buffer.getvalue()',
+            f'    result["answer"] = namespace.get("answer", {answer_default})',
+            "",
+        ]
+    )
+    if not sandboxed:
+        lines.append("    # Save answer to file for persistence")
+    lines.extend(
+        [
+            '    with open(ANSWER_FILE, "w", encoding="utf-8") as f:',
+            '        json.dump(result["answer"], f)',
+            "",
+            '    with open(RESPONSE_FIFO, "w", encoding="utf-8") as response_file:',
+            "        response_file.write(json.dumps(result))",
+        ]
+    )
+
+    return "\n".join(lines) + "\n"
+
+
+_RLM_WORKER_SCRIPT_TEMPLATE = _build_python_worker_script_template(sandboxed=False)
 
 
 _RLM_BASH_TOOL_HELPER_SCRIPT = textwrap.dedent(
@@ -1166,167 +1243,8 @@ _RLM_BASH_WORKER_SCRIPT_TEMPLATE = textwrap.dedent(
 )
 
 
-_RLM_SANDBOX_PY_WORKER_SCRIPT_TEMPLATE = textwrap.dedent(
-    """
-    import ast
-    import base64
-    import contextlib
-    import io
-    import json
-    import os
-    import pickle
-    import sys
-    import traceback
-    from pathlib import Path
-    import requests
-
-    COMMAND_FIFO = "{command_fifo}"
-    RESPONSE_FIFO = "{response_fifo}"
-    READY_FLAG = "{ready_flag}"
-    CONTEXT_FILE = "{context_file}"
-    ANSWER_FILE = "{answer_file}"
-
-    def ensure_fifo(path: str) -> None:
-        if os.path.exists(path):
-            os.remove(path)
-        os.mkfifo(path)
-
-    for fifo_path in (COMMAND_FIFO, RESPONSE_FIFO):
-        ensure_fifo(fifo_path)
-
-    fs_root = None
-    fs_metadata = {}
-    if Path(CONTEXT_FILE).exists():
-        with open(CONTEXT_FILE, "r", encoding="utf-8") as f:
-            context = json.load(f)
-            fs_root = context.get("fs_root")
-            fs_metadata = context.get("fs_metadata") or {}
-
-    if fs_root:
-        os.chdir(fs_root)
-
-    answer = {"ready": False, "content": ""}
-    if Path(ANSWER_FILE).exists():
-        with open(ANSWER_FILE, "r", encoding="utf-8") as f:
-            answer = json.load(f)
-
-    ROOT_TOOL_URL = os.environ.get("RLM_ROOT_TOOL_URL", "")
-    ROOT_TOOL_SERIALIZATION = os.environ.get("RLM_ROOT_TOOL_SERIALIZATION", "pickle")
-    ROOT_TOOL_NAMES_RAW = os.environ.get("RLM_ROOT_TOOL_NAMES", "[]")
-    try:
-        ROOT_TOOL_NAMES = json.loads(ROOT_TOOL_NAMES_RAW)
-    except Exception:
-        ROOT_TOOL_NAMES = []
-
-    def _call_root_tool(tool_name: str, args: tuple, kwargs: dict):
-        if not ROOT_TOOL_URL:
-            raise RuntimeError("Root tool URL not configured")
-        if ROOT_TOOL_SERIALIZATION != "pickle":
-            raise RuntimeError("Only pickle serialization is supported")
-
-        args_payload = base64.b64encode(pickle.dumps(args)).decode("ascii")
-        kwargs_payload = base64.b64encode(pickle.dumps(kwargs)).decode("ascii")
-        payload = {
-            "tool_name": tool_name,
-            "serialization": "pickle",
-            "args": args_payload,
-            "kwargs": kwargs_payload,
-        }
-
-        resp = requests.post(
-            ROOT_TOOL_URL,
-            json=payload,
-            timeout=300,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("print_lines"):
-            for line in data["print_lines"]:
-                print(line)
-        if data.get("error"):
-            raise RuntimeError(data["error"])
-        return pickle.loads(base64.b64decode(data.get("result", "")))
-
-    def _make_root_tool(name: str):
-        def _tool(*args, **kwargs):
-            return _call_root_tool(name, args, kwargs)
-
-        _tool.__name__ = name
-        return _tool
-
-    extra_data = fs_root
-
-    namespace: dict[str, object] = {
-        "__name__": "__main__",
-        "extra_data": extra_data,
-        "fs_metadata": fs_metadata,
-        "answer": answer,
-    }
-    for tool_name in ROOT_TOOL_NAMES:
-        namespace[tool_name] = _make_root_tool(tool_name)
-
-    Path(READY_FLAG).write_text("ready", encoding="utf-8")
-
-    execution_count = 0
-
-    while True:
-        with open(COMMAND_FIFO, "r", encoding="utf-8") as command_file:
-            payload = command_file.read()
-        if not payload:
-            continue
-        request = json.loads(payload)
-        if request.get("shutdown"):
-            break
-
-        code = request.get("code", "")
-        seq = request.get("seq", 0)
-        execution_count += 1
-
-        result = {
-            "status": "ok",
-            "stdout": "",
-            "stderr": "",
-            "result": None,
-            "execution_count": execution_count,
-            "seq": seq,
-            "answer": namespace.get("answer", {"ready": False, "content": ""}),
-        }
-
-        stdout_buffer = io.StringIO()
-        stderr_buffer = io.StringIO()
-
-        try:
-            with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
-                module_ast = ast.parse(code, mode="exec")
-                body = list(module_ast.body)
-                trailing_expr = None
-                if body and isinstance(body[-1], ast.Expr):
-                    trailing_expr = body.pop()
-                if body:
-                    exec_module = ast.Module(body=body, type_ignores=[])
-                    exec(compile(exec_module, "<cell>", "exec"), namespace, namespace)
-                if trailing_expr is not None:
-                    value = eval(
-                        compile(ast.Expression(trailing_expr.value), "<cell>", "eval"),
-                        namespace,
-                        namespace,
-                    )
-                    if value is not None:
-                        result["result"] = repr(value)
-        except Exception:
-            result["status"] = "error"
-            result["result"] = traceback.format_exc()
-
-        result["stdout"] = stdout_buffer.getvalue()
-        result["stderr"] = stderr_buffer.getvalue()
-        result["answer"] = namespace.get("answer", {"ready": False, "content": ""})
-
-        with open(ANSWER_FILE, "w", encoding="utf-8") as f:
-            json.dump(result["answer"], f)
-
-        with open(RESPONSE_FIFO, "w", encoding="utf-8") as response_file:
-            response_file.write(json.dumps(result))
-    """
+_RLM_SANDBOX_PY_WORKER_SCRIPT_TEMPLATE = _build_python_worker_script_template(
+    sandboxed=True
 )
 
 
@@ -1965,21 +1883,7 @@ class LocalRLMExecutor(BaseRLMExecutor):
 
         env_vars = os.environ.copy()
         env_vars.update(
-            {
-                "RLM_INTERCEPTION_URL": state["interception_url"],
-                "RLM_ROOT_TOOL_URL": state.get("root_tool_url", ""),
-                "RLM_ROOT_TOOL_NAMES": json.dumps(self.env.root_tool_names),
-                "RLM_ROOT_TOOL_SERIALIZATION": self.env.root_tool_serialization,
-                "RLM_SUB_MODEL": self.env.sub_model or state.get("model", ""),
-                "RLM_MAX_SUB_LLM_PARALLELISM": str(self.env.max_sub_llm_parallelism),
-                "RLM_SUB_LLM_STAGGER_MS": str(self.env.sub_llm_stagger_ms),
-                "RLM_SUB_LLM_STAGGER_JITTER_MS": str(
-                    self.env.sub_llm_stagger_jitter_ms
-                ),
-                "RLM_SUB_LLM_TIMEOUT": str(self.env.sub_llm_timeout),
-                "RLM_DISALLOWED_MODULES": self.env.disallowed_modules,
-                "RLM_DISALLOWED_BUILTINS": self.env.disallowed_builtins,
-            }
+            self.env._build_worker_env_vars(state, include_restrictions=True)
         )
 
         if self.env.repl_language == "python":
@@ -2314,7 +2218,6 @@ class SandboxRLMExecutor(BaseRLMExecutor, SandboxExecutorMixin):
                 session.paths.answer_file,
             ],
         }
-
         context_path = Path(session.local_control_dir) / "rlm_context.json"
         answer_path = Path(session.local_control_dir) / "rlm_answer.json"
         worker_path = Path(session.local_control_dir) / "rlm_worker.py"
@@ -2346,17 +2249,7 @@ class SandboxRLMExecutor(BaseRLMExecutor, SandboxExecutorMixin):
         sandbox_id = session.sandbox_id
         if not sandbox_id:
             raise vf.SandboxError() from Exception("Sandbox not initialized")
-        env_vars = {
-            "RLM_INTERCEPTION_URL": state.get("interception_url", ""),
-            "RLM_ROOT_TOOL_URL": state.get("root_tool_url", ""),
-            "RLM_ROOT_TOOL_NAMES": json.dumps(self.env.root_tool_names),
-            "RLM_ROOT_TOOL_SERIALIZATION": self.env.root_tool_serialization,
-            "RLM_SUB_MODEL": self.env.sub_model or state.get("model", ""),
-            "RLM_MAX_SUB_LLM_PARALLELISM": str(self.env.max_sub_llm_parallelism),
-            "RLM_SUB_LLM_STAGGER_MS": str(self.env.sub_llm_stagger_ms),
-            "RLM_SUB_LLM_STAGGER_JITTER_MS": str(self.env.sub_llm_stagger_jitter_ms),
-            "RLM_SUB_LLM_TIMEOUT": str(self.env.sub_llm_timeout),
-        }
+        env_vars = self.env._build_worker_env_vars(state, include_restrictions=False)
 
         exports = " ".join(
             f"{key}={shlex.quote(str(value))}"
@@ -2618,12 +2511,12 @@ class RLMEnv(vf.StatefulToolEnv):
                    The root model can call these inside the REPL as Python functions.
         sub_tools: List of tools available only to sub-LLMs.
                    Sub-LLMs access these via standard tool calling.
-        sub_model: Model to use for sub-LLM calls (defaults to same as root model)
         (Ordering) The root tool list is: fixed tools (e.g. llm_batch), then `tools`,
                    then `root_tools`. The sub-LLM tool list is: `tools`, then `sub_tools`.
                    Each list is deduplicated by tool name. If two different tools
                    share a name within a list, initialization raises an error.
         sub_tool_max_turns: Maximum tool-calling turns for sub-LLM calls (default: 5)
+        sub_model: Model to use for sub-LLM calls (defaults to same as root model)
         max_iterations: Maximum REPL iterations before stopping (maps to max_turns)
         max_output_length: Maximum length of code execution output
         max_sub_llm_parallelism: Maximum number of concurrent sub-LLM calls
@@ -2640,13 +2533,15 @@ class RLMEnv(vf.StatefulToolEnv):
                    tunnel startup is skipped.
         pip_install_packages: Space-separated packages to install in addition to requests
                    (default: "")
-        max_startup_wait_seconds: Maximum seconds to wait for worker startup (default: 120)
+        disallowed_modules: Space-separated module names that user code may not import.
+        disallowed_builtins: Space-separated builtin names removed from user code execution.
         include_sub_llm_in_trajectory: Whether to include sub-LLM calls as trajectory steps.
                    When True (default), sub-LLM turns are prepended to the trajectory as
                    TrajectoryStep objects with tokens, enabling training on sub-LLM calls.
                    When False, sub-LLM calls happen but are not stored.
         context_warning_threshold: Fraction of max_seq_len at which to warn the model
                    to finish (default: 0.80). Only active if max_seq_len is set.
+        max_startup_wait_seconds: Maximum seconds to wait for worker startup (default: 120)
         code_execution_timeout: Timeout in seconds for code execution (default: 120).
                    This is longer than the default command timeout to allow for
                    llm_batch calls which can take several minutes.
@@ -2655,8 +2550,7 @@ class RLMEnv(vf.StatefulToolEnv):
                    try a more efficient approach.
         retain_filesystem_after_rollout: If True, keep filesystem after rollout.
         filesystem_copy_max_bytes: Optional max bytes for context directory copy.
-        disallowed_modules: Space-separated module names that user code may not import.
-        disallowed_builtins: Space-separated builtin names removed from user code execution.
+        local_repl_max_workers: Max worker threads for local REPL execution.
         sandbox_docker_image: Docker image for sandbox backend (default: python:3.11-slim)
         sandbox_start_command: Start command for sandbox backend (default: tail -f /dev/null)
         sandbox_cpu_cores: Sandbox CPU cores (default: 1)
@@ -2671,7 +2565,6 @@ class RLMEnv(vf.StatefulToolEnv):
         sandbox_client_max_workers: Sandbox client pool size (default: 10)
         sandbox_client_max_connections: Sandbox client max connections (default: 100)
         sandbox_client_max_keepalive_connections: Sandbox client keepalive conns (default: 50)
-        local_repl_max_workers: Max worker threads for local REPL execution.
         **kwargs: Additional arguments passed to StatefulToolEnv
     """
 
@@ -2679,9 +2572,9 @@ class RLMEnv(vf.StatefulToolEnv):
         self,
         tools: list[Callable] | None = None,
         root_tools: list[Callable] | None = None,
-        sub_model: str | None = None,
         sub_tools: list[Callable] | None = None,
         sub_tool_max_turns: int = 5,
+        sub_model: str | None = None,
         max_iterations: int = 50,
         max_output_length: int = 8192,
         max_sub_llm_parallelism: int = 5,
@@ -2696,15 +2589,16 @@ class RLMEnv(vf.StatefulToolEnv):
         interception_port: int = 8766,
         interception_url: str | None = None,
         pip_install_packages: str = "",
-        max_startup_wait_seconds: int = 120,
+        disallowed_modules: str = "",
+        disallowed_builtins: str = "",
         include_sub_llm_in_trajectory: bool = True,
         context_warning_threshold: float = 0.80,
+        max_startup_wait_seconds: int = 120,
         code_execution_timeout: int = 120,
         abort_on_code_timeout: bool = False,
         retain_filesystem_after_rollout: bool = False,
         filesystem_copy_max_bytes: int | None = 1_000_000_000,
-        disallowed_modules: str = "",
-        disallowed_builtins: str = "",
+        local_repl_max_workers: int | None = None,
         sandbox_docker_image: str = "python:3.11-slim",
         sandbox_start_command: str = "tail -f /dev/null",
         sandbox_cpu_cores: int = 1,
@@ -2719,37 +2613,15 @@ class RLMEnv(vf.StatefulToolEnv):
         sandbox_client_max_workers: int = 10,
         sandbox_client_max_connections: int = 100,
         sandbox_client_max_keepalive_connections: int = 50,
-        local_repl_max_workers: int | None = None,
-        rubric: Rubric | None = None,
         **kwargs,
     ):
-        if tools is None and "tools" in kwargs:
-            tools = kwargs.pop("tools")
-        elif tools is not None and "tools" in kwargs:
-            raise ValueError("Tools were provided twice: use tools=... only once.")
-
-        if root_tools is None and "root_tools" in kwargs:
-            root_tools = kwargs.pop("root_tools")
-        elif root_tools is not None and "root_tools" in kwargs:
-            raise ValueError(
-                "root_tools were provided twice: use root_tools=... only once."
-            )
-
-        if sub_tools is None and "sub_tools" in kwargs:
-            sub_tools = kwargs.pop("sub_tools")
-        elif sub_tools is not None and "sub_tools" in kwargs:
-            raise ValueError(
-                "sub_tools were provided twice: use sub_tools=... only once."
-            )
-
         if repl_language not in {"bash", "python"}:
             raise ValueError(
                 f"Unsupported repl_language '{repl_language}'. Expected 'bash' or 'python'."
             )
         if execution_backend not in {"local", "sandbox"}:
             raise ValueError(
-                "execution_backend must be 'local' or 'sandbox', got "
-                f"'{execution_backend}'."
+                f"Unsupported execution_backend '{execution_backend}'. Expected 'local' or 'sandbox'."
             )
         self.repl_language = repl_language
         self.execution_backend = execution_backend
@@ -2825,17 +2697,13 @@ class RLMEnv(vf.StatefulToolEnv):
             context="sub-LLM tools",
             reserved_names=set(_FIXED_REPL_TOOL_NAMES),
         )
-        self.sub_oai_tools = [convert_func_to_oai_tool(tool) for tool in self.sub_tools]
+        self.sub_oai_tools: list[ChatCompletionFunctionToolParam] = [
+            convert_func_to_oai_tool(tool) for tool in self.sub_tools
+        ]
         self.root_tool_doc_funcs: list[Callable] = []
         for tool in self.root_tools:
-            name = _tool_display_name(tool)
-            if name in _FIXED_REPL_TOOL_NAMES:
-                self.root_tool_doc_funcs.append(
-                    self._build_fixed_root_tool_schema(name)
-                )
-            else:
-                self.root_tool_doc_funcs.append(tool)
-        self.root_oai_tools = [
+            self.root_tool_doc_funcs.append(tool)
+        self.root_oai_tools: list[ChatCompletionFunctionToolParam] = [
             convert_func_to_oai_tool(tool) for tool in self.root_tool_doc_funcs
         ]
         self.root_tool_names = [_tool_display_name(tool) for tool in self.root_tools]
@@ -2859,7 +2727,6 @@ class RLMEnv(vf.StatefulToolEnv):
         super().__init__(
             tools=[],
             max_turns=max_iterations,
-            rubric=rubric,
             **kwargs,
         )
         self.add_rubric(RLMMonitorRubric(root_tool_names=self.root_tool_names))
@@ -2894,8 +2761,7 @@ class RLMEnv(vf.StatefulToolEnv):
 
         if code_timeout < 10:
             logger.warning(
-                "code_execution_timeout=%s is low; sub-LLM calls may be unreliable",
-                code_timeout,
+                f"code_execution_timeout={code_timeout}s is low; sub-LLM calls may be unreliable"
             )
 
         return api_timeout, worker_timeout
@@ -2905,15 +2771,14 @@ class RLMEnv(vf.StatefulToolEnv):
 
         async def llm_batch(prompts: list[str]) -> list[str]:
             """
-            Make multiple sub-LLM calls in parallel.
+            Call the sub-LLM on multiple prompts in parallel.
 
-            Args:
-                prompts: List of prompt strings (recommended). Message dicts or lists
-                    of message dicts are also accepted for compatibility.
-
-            Returns:
-                List of response contents in the same order as the input prompts.
+            - Input: a list of prompt strings (recommended). Message dicts or lists
+              of message dicts are also accepted.
+            - Output: a list of responses in the same order as the input prompts.
+            - Use this inside the REPL to get help on sub-tasks.
             """
+            # Context is injected only when called via the REPL root-tool endpoint.
             context = self._root_tool_context_var.get()
             if context is None:
                 raise RuntimeError(
@@ -2925,24 +2790,31 @@ class RLMEnv(vf.StatefulToolEnv):
         llm_batch.__name__ = "llm_batch"
         return [llm_batch]
 
-    def _build_fixed_root_tool_schema(self, name: str) -> Callable:
-        """Return a schema-only stub for fixed root tools."""
-        if name == "llm_batch":
-
-            def llm_batch(prompts: list[str]) -> list[str]:
-                """Make multiple sub-LLM calls in parallel."""
-                raise RuntimeError("llm_batch schema stub should not be executed.")
-
-            llm_batch.__name__ = "llm_batch"
-            return llm_batch
-        raise ValueError(f"Unsupported fixed tool schema: {name}")
-
     def _compute_install_wait_seconds(self) -> int:
         """Estimate how long to wait for pip installs based on package count."""
         packages = [p.strip() for p in self.pip_install_packages.split() if p.strip()]
         package_count = len(packages) + 1  # Always includes requests
         estimated_seconds = 30 * package_count
         return max(self.max_startup_wait_seconds, estimated_seconds)
+
+    def _build_worker_env_vars(
+        self, state: State, *, include_restrictions: bool
+    ) -> dict[str, str]:
+        env_vars = {
+            "RLM_INTERCEPTION_URL": state.get("interception_url", ""),
+            "RLM_ROOT_TOOL_URL": state.get("root_tool_url", ""),
+            "RLM_ROOT_TOOL_NAMES": json.dumps(self.root_tool_names),
+            "RLM_ROOT_TOOL_SERIALIZATION": self.root_tool_serialization,
+            "RLM_SUB_MODEL": self.sub_model or state.get("model", ""),
+            "RLM_MAX_SUB_LLM_PARALLELISM": str(self.max_sub_llm_parallelism),
+            "RLM_SUB_LLM_STAGGER_MS": str(self.sub_llm_stagger_ms),
+            "RLM_SUB_LLM_STAGGER_JITTER_MS": str(self.sub_llm_stagger_jitter_ms),
+            "RLM_SUB_LLM_TIMEOUT": str(self.sub_llm_timeout),
+        }
+        if include_restrictions:
+            env_vars["RLM_DISALLOWED_MODULES"] = self.disallowed_modules
+            env_vars["RLM_DISALLOWED_BUILTINS"] = self.disallowed_builtins
+        return env_vars
 
     def _generate_packages_documentation(self) -> str:
         """Generate documentation for installed packages to include in system prompt."""
@@ -2956,10 +2828,10 @@ class RLMEnv(vf.StatefulToolEnv):
         if not packages:
             return ""
 
-        lines = ["\n## Installed Packages\n"]
-        lines.append(
-            "The following Python packages are pre-installed in the REPL environment:\n"
-        )
+        lines = [
+            "\n## Installed Packages\n",
+            "The following Python packages are pre-installed in the REPL environment:\n",
+        ]
         for pkg in packages:
             lines.append(f"- `{pkg}`")
         lines.append("")
@@ -2967,17 +2839,10 @@ class RLMEnv(vf.StatefulToolEnv):
 
         return "\n".join(lines)
 
-    def _generate_sub_tools_documentation(self) -> str:
-        """Generate documentation for sub-agent tools to include in system prompt."""
-        if not self.sub_tools:
-            return ""
-
-        lines = ["\n## Sub-LLM Tools\n"]
-        lines.append(
-            "The sub-LLMs called via `llm_batch()` have access to the following tools:\n"
-        )
-
-        for oai_tool in self.sub_oai_tools:
+    def _append_tool_docs(
+        self, lines: list[str], oai_tools: list[ChatCompletionFunctionToolParam]
+    ) -> None:
+        for oai_tool in oai_tools:
             func_def = oai_tool["function"]
             name = func_def["name"]
             desc = func_def.get("description", "No description")
@@ -2995,6 +2860,18 @@ class RLMEnv(vf.StatefulToolEnv):
                     param_desc = param_info.get("description", "")
                     lines.append(f"- `{param_name}` ({param_type}): {param_desc}")
                 lines.append("")
+
+    def _generate_sub_tools_documentation(self) -> str:
+        """Generate documentation for sub-agent tools to include in system prompt."""
+        if not self.sub_tools:
+            return ""
+
+        lines = ["\n## Sub-LLM Tools\n"]
+        lines.append(
+            "The sub-LLMs called via `llm_batch()` have access to the following tools:\n"
+        )
+
+        self._append_tool_docs(lines, self.sub_oai_tools)
 
         lines.append(
             "When delegating tasks to sub-LLMs via `llm_batch()`, they can use these "
@@ -3022,24 +2899,7 @@ class RLMEnv(vf.StatefulToolEnv):
                 "The root model can call the following tools inside the Python REPL:\n"
             )
 
-        for oai_tool in self.root_oai_tools:
-            func_def = oai_tool["function"]
-            name = func_def["name"]
-            desc = func_def.get("description", "No description")
-            params = cast(
-                dict[str, Any], func_def.get("parameters", {}).get("properties", {})
-            )
-
-            lines.append(f"### `{name}`")
-            lines.append(f"{desc}\n")
-
-            if params:
-                lines.append("**Parameters:**")
-                for param_name, param_info in params.items():
-                    param_type = param_info.get("type", "any")
-                    param_desc = param_info.get("description", "")
-                    lines.append(f"- `{param_name}` ({param_type}): {param_desc}")
-                lines.append("")
+        self._append_tool_docs(lines, self.root_oai_tools)
 
         lines.append(
             "These tools run on the host and are only accessible from within the REPL."
@@ -3135,17 +2995,6 @@ class RLMEnv(vf.StatefulToolEnv):
             lines.append("You can still use this directory for any files you create.")
         lines.append("Never access files or directories outside the working directory.")
         return "\n".join(lines)
-
-    @staticmethod
-    def _extract_tokens(response: Any) -> tuple[int, int]:
-        """Extract prompt and completion tokens from response usage."""
-        usage = getattr(response, "usage", None)
-        if not usage:
-            return 0, 0
-        return (
-            getattr(usage, "prompt_tokens", 0) or 0,
-            getattr(usage, "completion_tokens", 0) or 0,
-        )
 
     @staticmethod
     def _normalize_sampling_args(sampling_args: dict[str, Any]) -> dict[str, Any]:
@@ -3315,7 +3164,7 @@ class RLMEnv(vf.StatefulToolEnv):
             if response is None:
                 return self._make_timeout_result([], 0, 0, 0, 0)
 
-            prompt_tokens, completion_tokens = self._extract_tokens(response)
+            prompt_tokens, completion_tokens = _extract_tokens_from_response(response)
             return SubLLMResult(
                 final_content=response.choices[0].message.content or "",
                 turns=[
@@ -3357,7 +3206,7 @@ class RLMEnv(vf.StatefulToolEnv):
                     num_turns,
                 )
 
-            prompt_tokens, completion_tokens = self._extract_tokens(response)
+            prompt_tokens, completion_tokens = _extract_tokens_from_response(response)
             total_prompt_tokens += prompt_tokens
             total_completion_tokens += completion_tokens
 
@@ -3427,7 +3276,7 @@ class RLMEnv(vf.StatefulToolEnv):
                 prompt_messages=prompt_snapshot, response=response, tool_call_count=0
             )
         )
-        prompt_tokens, completion_tokens = self._extract_tokens(response)
+        prompt_tokens, completion_tokens = _extract_tokens_from_response(response)
 
         return SubLLMResult(
             final_content=response.choices[0].message.content or "",
@@ -3545,13 +3394,15 @@ class RLMEnv(vf.StatefulToolEnv):
             if meta.get("error"):
                 summary_lines.append(f"  [{index}]: error ({elapsed:.2f}s)")
                 continue
-            tokens = meta.get("prompt_tokens", 0) + meta.get("completion_tokens", 0)
+            prompt_tokens = meta.get("prompt_tokens", 0)
+            completion_tokens = meta.get("completion_tokens", 0)
             tool_calls = meta.get("tool_call_count", 0)
             max_turns = meta.get("max_turns_reached", False)
             status = "⚠ max turns" if max_turns else "✓"
             summary_lines.append(
-                f"  [{index}]: {tokens} tokens, {tool_calls} tool calls, "
-                f"{elapsed:.2f}s {status}"
+                f"  [{index}]: {prompt_tokens} prompt tokens, "
+                f"{completion_tokens} completion tokens, "
+                f"{tool_calls} tool calls, {elapsed:.2f}s {status}"
             )
 
         return contents, summary_lines
@@ -4172,9 +4023,79 @@ class RLMEnv(vf.StatefulToolEnv):
 
         return output
 
+    def _maybe_add_context_warning(
+        self, output: str, state: State, *, ready_instruction: str
+    ) -> str:
+        """Append a context-limit warning if nearing max_seq_len."""
+        if not self.max_seq_len or state.get("context_warning_sent"):
+            return output
+
+        trajectory = state.get("trajectory", [])
+        last_main = next(
+            (
+                step
+                for step in reversed(trajectory)
+                if not step.get("extras", {}).get("is_sub_llm_call")
+            ),
+            None,
+        )
+        response = last_main.get("response") if last_main else None
+        usage = getattr(response, "usage", None) if response else None
+        prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0 if usage else 0
+        warning_threshold = int(self.max_seq_len * self.context_warning_threshold)
+
+        if prompt_tokens >= warning_threshold:
+            state["context_warning_sent"] = True
+            pct = prompt_tokens / self.max_seq_len
+            output += (
+                f"\n\n[CONTEXT LIMIT WARNING] You have used {prompt_tokens:,} of "
+                f"{self.max_seq_len:,} tokens ({pct:.0%}). {ready_instruction}"
+            )
+
+        return output
+
     # =========================================================================
     # REPL Tool
     # =========================================================================
+
+    async def _call_repl(
+        self,
+        code: str,
+        state: Any,
+        *,
+        ready_instruction: str,
+        append_execution_time: bool,
+    ) -> str:
+        rollout_id = state.get("rollout_id")
+        if rollout_id and rollout_id in self.active_rollouts:
+            self.active_rollouts[rollout_id]["current_turn"] = state.get("turn", 0)
+
+        execution_start = perf_counter()
+        result = await self._execute_code(code, state)
+        execution_time = perf_counter() - execution_start
+        output = self._format_execution_output(result)
+
+        state.setdefault("tool_call_timings", []).append(
+            {
+                "turn": state.get("turn", 0),
+                "execution_seconds": execution_time,
+            }
+        )
+        _update_rlm_repl_metrics(state, execution_time)
+
+        if append_execution_time:
+            output += f"\n[Execution time: {execution_time:.2f}s]"
+
+        answer = result.get("answer", {})
+        if answer.get("ready", False):
+            state["final_answer"] = answer.get("content", "")
+            logger.debug(f"Answer ready: {state['final_answer'][:100]}...")
+
+        output = self._maybe_add_context_warning(
+            output, state, ready_instruction=ready_instruction
+        )
+
+        return output
 
     async def call_bash_repl(self, code: str, state: Any) -> str:
         """
@@ -4194,54 +4115,12 @@ class RLMEnv(vf.StatefulToolEnv):
         Returns:
             Raw execution output (stdout/stderr combined)
         """
-        rollout_id = state.get("rollout_id")
-        if rollout_id and rollout_id in self.active_rollouts:
-            self.active_rollouts[rollout_id]["current_turn"] = state.get("turn", 0)
-
-        execution_start = perf_counter()
-        result = await self._execute_code(code, state)
-        execution_time = perf_counter() - execution_start
-        output = self._format_execution_output(result)
-
-        state.setdefault("tool_call_timings", []).append(
-            {
-                "turn": state.get("turn", 0),
-                "execution_seconds": execution_time,
-            }
+        return await self._call_repl(
+            code,
+            state,
+            ready_instruction="Please finalize your answer soon by setting RLM_READY=1.",
+            append_execution_time=False,
         )
-        _update_rlm_repl_metrics(state, execution_time)
-
-        answer = result.get("answer", {})
-        if answer.get("ready", False):
-            state["final_answer"] = answer.get("content", "")
-            logger.debug(f"Answer ready: {state['final_answer'][:100]}...")
-
-        # Inject context limit warning if approaching limit
-        if self.max_seq_len and not state.get("context_warning_sent"):
-            trajectory = state.get("trajectory", [])
-            last_main = next(
-                (
-                    step
-                    for step in reversed(trajectory)
-                    if not step.get("extras", {}).get("is_sub_llm_call")
-                ),
-                None,
-            )
-            response = last_main.get("response") if last_main else None
-            usage = getattr(response, "usage", None) if response else None
-            prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0 if usage else 0
-            warning_threshold = int(self.max_seq_len * self.context_warning_threshold)
-
-            if prompt_tokens >= warning_threshold:
-                state["context_warning_sent"] = True
-                pct = prompt_tokens / self.max_seq_len
-                output += (
-                    f"\n\n[CONTEXT LIMIT WARNING] You have used {prompt_tokens:,} of "
-                    f"{self.max_seq_len:,} tokens ({pct:.0%}). Please finalize your answer "
-                    "soon by setting RLM_READY=1."
-                )
-
-        return output
 
     async def call_python_repl(self, code: str, state: Any) -> str:
         """
@@ -4268,61 +4147,12 @@ class RLMEnv(vf.StatefulToolEnv):
         Returns:
             Execution output including stdout, stderr, and expression results
         """
-        # Update current turn in rollout context for sub-LLM call tracking
-        rollout_id = state.get("rollout_id")
-        if rollout_id and rollout_id in self.active_rollouts:
-            self.active_rollouts[rollout_id]["current_turn"] = state.get("turn", 0)
-        # Time the full tool call execution
-        execution_start = perf_counter()
-        result = await self._execute_code(code, state)
-        execution_time = perf_counter() - execution_start
-        output = self._format_execution_output(result)
-
-        # Track timing in state for metrics
-        state.setdefault("tool_call_timings", []).append(
-            {
-                "turn": state.get("turn", 0),
-                "execution_seconds": execution_time,
-            }
+        return await self._call_repl(
+            code,
+            state,
+            ready_instruction="Please finalize your answer soon by setting answer['ready'] = True.",
+            append_execution_time=True,
         )
-        _update_rlm_repl_metrics(state, execution_time)
-
-        # Append execution time to output
-        output += f"\n[Execution time: {execution_time:.2f}s]"
-
-        # Check if answer is ready
-        answer = result.get("answer", {})
-        if answer.get("ready", False):
-            state["final_answer"] = answer.get("content", "")
-            logger.debug(f"Answer ready: {state['final_answer'][:100]}...")
-
-        # Inject context limit warning if approaching limit
-        if self.max_seq_len and not state.get("context_warning_sent"):
-            # Get prompt token count from latest main-model trajectory response
-            trajectory = state.get("trajectory", [])
-            last_main = next(
-                (
-                    step
-                    for step in reversed(trajectory)
-                    if not step.get("extras", {}).get("is_sub_llm_call")
-                ),
-                None,
-            )
-            response = last_main.get("response") if last_main else None
-            usage = getattr(response, "usage", None) if response else None
-            prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0 if usage else 0
-            warning_threshold = int(self.max_seq_len * self.context_warning_threshold)
-
-            if prompt_tokens >= warning_threshold:
-                state["context_warning_sent"] = True
-                pct = prompt_tokens / self.max_seq_len
-                output += (
-                    f"\n\n[CONTEXT LIMIT WARNING] You have used {prompt_tokens:,} of "
-                    f"{self.max_seq_len:,} tokens ({pct:.0%}). Please finalize your answer "
-                    "soon by setting answer['ready'] = True."
-                )
-
-        return output
 
     async def add_trajectory_step(self, state: State, trajectory_step: TrajectoryStep):
         update_rlm_metrics_from_step(state, trajectory_step)
