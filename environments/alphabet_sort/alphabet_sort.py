@@ -44,7 +44,7 @@ def get_dataset_builder(
     dataset_name: str = "kalomaze/alphabetic-arxiv-authors-it1",
     dataset_split: str = "train",
     seed: int = 1337420,
-) -> vf.DatasetBuilder:
+):
     """Returns a DatasetBuilder that lazily builds the alphabet sorting dataset."""
 
     def build() -> Dataset:
