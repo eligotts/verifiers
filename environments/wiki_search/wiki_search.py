@@ -34,8 +34,6 @@ def load_environment(
     corpus_split: str = "train",
     chroma_db_dir: str = CHROMA_DB_DIR,
 ) -> vf.Environment:
-    vf.ensure_keys([judge_api_key_var, embed_api_key_var])
-
     # load corpus into memory and build page_id -> row index
     corpus = load_dataset(corpus_dataset, split=corpus_split)
     page_id_to_title: dict[str, str] = {}
@@ -56,7 +54,7 @@ def load_environment(
             openai_ef = embedding_functions.OpenAIEmbeddingFunction(
                 model_name=embed_model,
                 api_base=embed_base_url,
-                api_key=os.environ[embed_api_key_var],
+                api_key=os.getenv(embed_api_key_var, "EMPTY"),
             )
             client = chromadb.PersistentClient(path=chroma_db_dir)
             _chroma_state["collection"] = client.get_or_create_collection(
