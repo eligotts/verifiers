@@ -3008,6 +3008,8 @@ class RLMEnv(vf.StatefulToolEnv):
                 "tool_call_id": tool_call_id,
             }
         except Exception as e:
+            if self._should_stop_for_error(e):
+                raise
             return {
                 "role": "tool",
                 "content": f"Error: {e}",
@@ -3277,6 +3279,8 @@ class RLMEnv(vf.StatefulToolEnv):
                         elapsed
                     )
                 except Exception as exc:
+                    if self._should_stop_for_error(exc):
+                        raise
                     elapsed = perf_counter() - start_time
                     response_dict = {
                         "choices": [
@@ -3550,6 +3554,8 @@ class RLMEnv(vf.StatefulToolEnv):
                 result_value = await maybe_await(tool_func, *args, **kwargs)
                 print_lines = None
         except Exception as e:
+            if self._should_stop_for_error(e):
+                state_ref["_rlm_stop_error"] = e
             return web.json_response({"error": str(e)}, status=500)
         finally:
             self._root_tool_context_var.reset(token)
@@ -3603,6 +3609,8 @@ class RLMEnv(vf.StatefulToolEnv):
             )
             return web.json_response(response_dict)
         except Exception as e:
+            if self._should_stop_for_error(e):
+                state_ref["_rlm_stop_error"] = e
             return web.json_response({"error": str(e)}, status=500)
 
     async def _teardown_interception_server(self):
@@ -4000,6 +4008,9 @@ class RLMEnv(vf.StatefulToolEnv):
 
         execution_start = perf_counter()
         result = await self._execute_code(code, state)
+        stop_exc = state.pop("_rlm_stop_error", None)
+        if stop_exc is not None:
+            raise stop_exc
         execution_time = perf_counter() - execution_start
         output = self._format_execution_output(result)
 
