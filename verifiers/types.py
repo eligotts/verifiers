@@ -100,6 +100,38 @@ class RolloutTiming(TypedDict, total=False):
     total_ms: float
 
 
+class RolloutOutput(dict):
+    """Serialized output from a rollout (mirrors RolloutInput).
+
+    A dict subclass that allows typed access to known fields while supporting
+    arbitrary additional fields from state_columns. All values must be
+    JSON-serializable.
+
+    Required fields: example_id, task, prompt, completion, reward, timing,
+                     is_completed, is_truncated, metrics
+    Optional fields: answer, info, error, stop_condition, trajectory, oai_tools
+    Additional fields: arbitrary serializable state_columns
+    """
+
+    # Required fields
+    example_id: int
+    task: str
+    prompt: Messages | None
+    completion: Messages | None
+    reward: float
+    timing: RolloutTiming
+    is_completed: bool
+    is_truncated: bool
+    metrics: dict[str, float]
+    # Optional fields
+    answer: str
+    info: Info
+    error: str | None
+    stop_condition: str | None
+    trajectory: list["TrajectoryStep"]
+    oai_tools: list["ChatCompletionToolParam"]
+
+
 class State(dict):
     INPUT_FIELDS = ["prompt", "answer", "task", "info", "example_id"]
     # rollout inputs
@@ -149,7 +181,9 @@ JsonPrimitive = Literal["string", "number", "integer", "boolean", "array", "obje
 
 # callbacks
 StartCallback = Callable[[int], None]  # total rollouts
-ProgressCallback = Callable[[list[State], list[State]], None]  # all_states, new_states
+ProgressCallback = Callable[
+    [list[RolloutOutput], list[RolloutOutput]], None
+]  # all_outputs, new_outputs
 LogCallback = Callable[[str], None]  # log messages
 
 
@@ -173,19 +207,9 @@ class GenerateMetadata(TypedDict):
 
 
 class GenerateOutputs(TypedDict):
-    """TypedDict for generation outputs."""
+    """TypedDict for generation outputs (results)."""
 
-    prompt: list[Messages]
-    completion: list[Messages]
-    answer: list[str]
-    state: list[State]
-    task: list[str]
-    info: list[Info]
-    example_id: list[int]
-    reward: list[float]
-    metrics: dict[str, list[float]]
-    stop_conditions: list[str | None]
-    is_truncated: list[bool]
+    outputs: list[RolloutOutput]
     metadata: GenerateMetadata
 
 
@@ -201,18 +225,6 @@ class RolloutScores(TypedDict):
 
     reward: list[float]
     metrics: dict[str, list[float]]
-
-
-class ProcessedOutputs(TypedDict):
-    """TypedDict for processed outputs."""
-
-    prompt_ids: list[list[int]]
-    prompt_mask: list[list[int]]
-    completion_ids: list[list[int]]
-    completion_mask: list[list[int]]
-    completion_logprobs: list[list[float]]
-    rewards: list[float]
-    is_truncated: list[bool]
 
 
 Endpoint = TypedDict("Endpoint", {"key": str, "url": str, "model": str})

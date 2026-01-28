@@ -116,6 +116,31 @@ class RolloutInput(TypedDict):
     info: Info              # Optional
 ```
 
+### RolloutOutput
+
+```python
+class RolloutOutput(dict):
+    # Required fields
+    example_id: int
+    task: str
+    prompt: Messages | None
+    completion: Messages | None
+    reward: float
+    timing: RolloutTiming
+    is_completed: bool
+    is_truncated: bool
+    metrics: dict[str, float]
+    # Optional fields
+    answer: str
+    info: Info
+    error: str | None
+    stop_condition: str | None
+    trajectory: list[TrajectoryStep]
+    oai_tools: list[ChatCompletionToolParam]
+```
+
+Serialized output from a rollout. This is a `dict` subclass that provides typed access to known fields while supporting arbitrary additional fields from `state_columns`. All values must be JSON-serializable. Used in `GenerateOutputs` and for saving results to disk.
+
 ### TrajectoryStep
 
 ```python
@@ -162,21 +187,11 @@ class RolloutTiming(TypedDict, total=False):
 
 ```python
 class GenerateOutputs(TypedDict):
-    prompt: list[Messages]
-    completion: list[Messages]
-    answer: list[str]
-    state: list[State]
-    task: list[str]
-    info: list[Info]
-    example_id: list[int]
-    reward: list[float]
-    metrics: dict[str, list[float]]
-    stop_conditions: list[str | None]
-    is_truncated: list[bool]
+    outputs: list[RolloutOutput]
     metadata: GenerateMetadata
 ```
 
-Output from `Environment.generate()`.
+Output from `Environment.generate()`. Contains a list of `RolloutOutput` objects (one per rollout) and generation metadata. Each `RolloutOutput` is a serialized, JSON-compatible dict containing the rollout's prompt, completion, answer, reward, metrics, timing, and other per-rollout data.
 
 ### GenerateMetadata
 
@@ -195,6 +210,7 @@ class GenerateMetadata(TypedDict):
     avg_metrics: dict[str, float]
     state_columns: list[str]
     path_to_save: Path
+    tools: list[ChatCompletionToolParam] | None
 ```
 
 ### RolloutScore / RolloutScores
@@ -208,21 +224,6 @@ class RolloutScores(TypedDict):
     reward: list[float]
     metrics: dict[str, list[float]]
 ```
-
-### ProcessedOutputs
-
-```python
-class ProcessedOutputs(TypedDict):
-    prompt_ids: list[list[int]]
-    prompt_mask: list[list[int]]
-    completion_ids: list[list[int]]
-    completion_mask: list[list[int]]
-    completion_logprobs: list[list[float]]
-    rewards: list[float]
-    is_truncated: list[bool]
-```
-
-Tokenized outputs for training.
 
 ---
 

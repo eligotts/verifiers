@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from transformers import PreTrainedTokenizerBase
 
 from verifiers import Environment
+from verifiers.types import Messages
 
 
 class Microbatch(BaseModel):
@@ -224,6 +225,7 @@ class Orchestrator:
             model=self.model_name,
             sampling_args=self.sampling_args,
             max_concurrent=self.max_concurrent,
+            state_columns=["trajectory"],  # Include trajectory for RL training
         )
         self.is_generating = False
         wall_clock_s = time.time() - start_time
@@ -234,10 +236,15 @@ class Orchestrator:
         completion_ids: list[list[int]] = []
         completion_mask: list[list[int]] = []
         completion_logprobs: list[list[float]] = []
+        prompts: list[Messages] = []
+        completions: list[Messages] = []
+        rewards: list[float] = []
+        metrics: dict[str, list[float]] = {}
         advantages: list[float] = []
 
-        for state in env_results["state"]:
-            trajectory = state["trajectory"]
+        outputs = env_results["outputs"]
+        for output in outputs:
+            trajectory = output["trajectory"]
             for step in trajectory:
                 tokens = step["tokens"]
                 if tokens is None:
@@ -248,15 +255,22 @@ class Orchestrator:
                 completion_mask.append(tokens["completion_mask"])
                 completion_logprobs.append(tokens["completion_logprobs"])
                 advantages.append(step["advantage"])
+            prompts.append(output["prompt"])
+            completions.append(output["completion"])
+            rewards.append(output["reward"])
+            for k, v in output["metrics"].items():
+                if k not in metrics:
+                    metrics[k] = []
+                metrics[k].append(v)
 
         # Build rewards_dict from rollout-level data (for logging only)
-        rewards_dict = {"reward": env_results["reward"]}
-        for k in env_results["metrics"]:
-            rewards_dict[k] = env_results["metrics"][k]
+        rewards_dict = {"reward": rewards}
+        for k in metrics:
+            rewards_dict[k] = metrics[k]
 
         metrics_dict = {}
-        if env_results["reward"]:
-            rewards_arr = np.asarray(env_results["reward"], dtype=np.float32)
+        if rewards:
+            rewards_arr = np.asarray(rewards, dtype=np.float32)
             metrics_dict["reward"] = float(rewards_arr.mean())
             metrics_dict["reward/std"] = float(rewards_arr.std())
 
@@ -290,8 +304,8 @@ class Orchestrator:
         generation_ms: list[float] = []
         scoring_ms: list[float] = []
         total_ms: list[float] = []
-        for state in env_results["state"]:
-            timing = state.get("timing", {})
+        for output in outputs:
+            timing = output.get("timing", {})
             if "generation_ms" in timing:
                 generation_ms.append(float(timing["generation_ms"]))
             if "scoring_ms" in timing:
@@ -307,7 +321,7 @@ class Orchestrator:
             metrics_dict["timing/total_ms"] = float(np.mean(total_ms))
 
         metrics_dict["wall_clock/generate_s"] = float(wall_clock_s)
-        errors = [state.get("error") for state in env_results["state"]]
+        errors = [output.get("error") for output in outputs]
 
         # build per-process microbatches
         N = len(advantages)
@@ -354,8 +368,8 @@ class Orchestrator:
             global_item_count=global_item_count,
             generation_time=wall_clock_s,
             rewards_dict=rewards_dict,
-            completions=env_results["completion"],
-            prompts=env_results["prompt"],
+            completions=completions,
+            prompts=prompts,
             errors=errors,
             metrics_dict=metrics_dict,
         )

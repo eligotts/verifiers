@@ -3,13 +3,19 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
+from gepa.core.adapter import EvaluationBatch
 from openai import AsyncOpenAI, OpenAI
 
-from gepa.core.adapter import EvaluationBatch
-
 from verifiers.envs.environment import Environment
-from verifiers.types import ClientConfig, Messages, RolloutInput, SamplingArgs, State
-from verifiers.utils.message_utils import message_to_printable, messages_to_printable
+from verifiers.types import (
+    ClientConfig,
+    Messages,
+    RolloutInput,
+    RolloutOutput,
+    SamplingArgs,
+)
+from verifiers.utils.message_utils import message_to_printable
+from verifiers.utils.save_utils import make_serializable
 
 if TYPE_CHECKING:
     from verifiers.gepa.display import GEPADisplay
@@ -76,7 +82,7 @@ class VerifiersGEPAAdapter:
         batch: list[RolloutInput],
         candidate: dict[str, str],
         capture_traces: bool = False,
-    ) -> EvaluationBatch[State, dict[str, Any]]:
+    ) -> EvaluationBatch[RolloutOutput, RolloutOutput]:
         """
         Run verifiers evaluation with the candidate system prompt.
         """
@@ -90,19 +96,13 @@ class VerifiersGEPAAdapter:
                 sampling_args=self.sampling_args,
                 max_concurrent=self.max_concurrent,
                 use_tqdm=self.use_tqdm,
+                state_columns=self.state_columns,
             )
         )
 
-        n_examples = len(results["reward"])
-        outputs: list[dict[str, Any]] = []
-        for i in range(n_examples):
-            outputs.append({
-                "prompt": results["prompt"][i],
-                "completion": results["completion"][i],
-                "answer": results["answer"][i],
-                "reward": results["reward"][i],
-                "example_id": results["example_id"][i],
-            })
+        outputs = results["outputs"]
+        example_ids = [o["example_id"] for o in outputs]
+        rewards = [o["reward"] for o in outputs]
 
         # Update display if configured
         if self.display is not None:
@@ -113,47 +113,48 @@ class VerifiersGEPAAdapter:
 
             self.display.update_eval(
                 candidate_idx=candidate_idx,
-                scores=results["reward"],
-                example_ids=results["example_id"],
+                scores=rewards,
+                example_ids=example_ids,
                 capture_traces=capture_traces,
             )
 
         return EvaluationBatch(
             outputs=outputs,
-            scores=results["reward"],
-            trajectories=results["state"] if capture_traces else None,
+            scores=rewards,
+            trajectories=outputs if capture_traces else None,
         )
 
     def make_reflective_dataset(
         self,
         candidate: dict[str, str],  # noqa: ARG002 - required by GEPA adapter protocol
-        eval_batch: EvaluationBatch[State, dict[str, Any]],
+        eval_batch: EvaluationBatch[RolloutOutput, RolloutOutput],
         components_to_update: list[str],
     ) -> Mapping[str, Sequence[Mapping[str, Any]]]:
         """Build reflective dataset for GEPA teacher LLM."""
-        outputs: list[dict[str, Any]] = eval_batch.outputs
-        states: list[State] = eval_batch.trajectories or []
+        outputs = eval_batch.outputs
+        trajectories = eval_batch.trajectories or []
         scores = eval_batch.scores
 
         records = []
-        # outputs, states, and scores should be the same length
-        for output, state, score in zip(outputs, states, scores):
+        # outputs, trajectories, and scores should be the same length
+        # Note: prompt/completion are already in printable format from state_to_output
+        for output, trajectory, score in zip(outputs, trajectories, scores):
             record: dict[str, Any] = {
                 "query": _extract_user_query(output["prompt"]),
-                "completion": messages_to_printable(output["completion"]),
-                "expected_answer": output["answer"],
+                "completion": output["completion"],
+                "expected_answer": output.get("answer", ""),
                 "reward": score,
             }
 
-            if state.get("error"):
-                record["error"] = repr(state["error"])
+            if trajectory.get("error"):
+                record["error"] = trajectory["error"]
 
-            if state.get("stop_condition"):
-                record["stop_condition"] = state["stop_condition"]
+            if trajectory.get("stop_condition"):
+                record["stop_condition"] = trajectory["stop_condition"]
 
             for col in self.state_columns:
-                if col in state:
-                    record[col] = _serialize(state[col])
+                if col in trajectory:
+                    record[col] = make_serializable(trajectory[col])
 
             records.append(record)
 
@@ -201,16 +202,3 @@ def _extract_user_query(prompt: Messages) -> str:
                 return content
             return str(content) if content else ""
     return ""
-
-
-def _serialize(value: Any) -> Any:
-    """Make value JSON-serializable."""
-    if hasattr(value, "model_dump"):
-        return value.model_dump()
-    if isinstance(value, list):
-        return [_serialize(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _serialize(v) for k, v in value.items()}
-    if isinstance(value, Exception):
-        return repr(value)
-    return value

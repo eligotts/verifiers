@@ -12,23 +12,23 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
+from typing import Callable
 
 import pytest
 from datasets import Dataset
+from openai import AsyncOpenAI
 
 import verifiers as vf
 from verifiers.envs.environment import Environment
 from verifiers.parsers.parser import Parser
 from verifiers.rubrics.rubric import Rubric
 from verifiers.types import (
-    GenerateMetadata,
     GenerateOutputs,
     RolloutInput,
     SamplingArgs,
 )
-from verifiers.utils.eval_utils import make_dataset as build_dataset
 from verifiers.utils.message_utils import sanitize_tool_calls
+from verifiers.utils.save_utils import make_dataset as build_dataset
 
 
 # Local simple concrete Environment for testing
@@ -84,43 +84,29 @@ class DummyEnvironment(Environment):
         return state
 
 
-def _make_metadata(
-    num_examples: int, rollouts_per_example: int = 1
-) -> GenerateMetadata:
-    return GenerateMetadata(
-        env_id="dummy-env",
-        env_args={},
-        model="test-model",
-        base_url="http://localhost",
-        num_examples=num_examples,
-        rollouts_per_example=rollouts_per_example,
-        sampling_args={},
-        date="1970-01-01",
-        time_ms=0.0,
-        avg_reward=0.0,
-        avg_metrics={},
-        state_columns=[],
-        path_to_save=Path("test.jsonl"),
-    )
+@pytest.fixture
+def make_dummy_env() -> Callable[[AsyncOpenAI, Dataset | None], DummyEnvironment]:
+    def _make_dummy_env(
+        mock_openai_client: AsyncOpenAI, dataset: Dataset | None = None, **kwargs
+    ) -> DummyEnvironment:
+        dataset = dataset or Dataset.from_dict({"question": ["q1"], "answer": ["a1"]})
+        return DummyEnvironment(
+            client=mock_openai_client,
+            model="test-model",
+            dataset=dataset,
+            parser=Parser(),
+            rubric=Rubric(),
+            **kwargs,
+        )
 
-
-def _make_env(
-    mock_openai_client, dataset: Dataset | None = None, **kwargs
-) -> DummyEnvironment:
-    ds = dataset or Dataset.from_dict({"question": ["q1"], "answer": ["a1"]})
-    return DummyEnvironment(
-        client=mock_openai_client,
-        model="test-model",
-        dataset=ds,
-        parser=Parser(),
-        rubric=Rubric(),
-        **kwargs,
-    )
+    return _make_dummy_env
 
 
 @pytest.mark.asyncio
-async def test_get_model_response_chat_with_tools(mock_openai_client):
-    env = _make_env(mock_openai_client)
+async def test_get_model_response_chat_with_tools(
+    mock_openai_client, make_dummy_env, make_input
+):
+    env = make_dummy_env(mock_openai_client)
     prompt: vf.Messages = [{"role": "user", "content": "Hello"}]
     tools = [
         {
@@ -129,7 +115,7 @@ async def test_get_model_response_chat_with_tools(mock_openai_client):
         }
     ]
     state = await env.init_state(
-        input=RolloutInput(example_id=0, task="test", prompt=prompt),
+        input=make_input(prompt=prompt),
         client=mock_openai_client,
         model="test-model",
     )
@@ -146,11 +132,13 @@ async def test_get_model_response_chat_with_tools(mock_openai_client):
 
 
 @pytest.mark.asyncio
-async def test_get_model_response_completion_rejects_tools(mock_openai_client):
-    env = _make_env(mock_openai_client, message_type="completion")
+async def test_get_model_response_completion_rejects_tools(
+    mock_openai_client, make_dummy_env, make_input
+):
+    env = make_dummy_env(mock_openai_client, message_type="completion")
     with pytest.raises(vf.ModelError):
         state = await env.init_state(
-            input=RolloutInput(example_id=0, task="test", prompt="Complete this"),
+            input=make_input(prompt=[{"role": "user", "content": "Complete this"}]),
             client=mock_openai_client,
             model="test-model",
         )
@@ -158,17 +146,12 @@ async def test_get_model_response_completion_rejects_tools(mock_openai_client):
         await env.get_model_response(state=state, prompt="Complete this")
 
 
-def test_run_rollouts_with_max_concurrent(mock_openai_client):
-    env = _make_env(mock_openai_client)
-    inputs = [
-        RolloutInput(
-            prompt=[{"role": "user", "content": "hi"}],
-            answer="",
-            example_id=i,
-        )
-        for i in range(3)
-    ]
-    results = asyncio.run(
+def test_run_rollouts_with_max_concurrent(
+    mock_openai_client, make_dummy_env, make_input
+):
+    env = make_dummy_env(mock_openai_client)
+    inputs = [make_input(example_id=i) for i in range(3)]
+    outputs = asyncio.run(
         env.generate(
             inputs,
             client=mock_openai_client,
@@ -176,37 +159,17 @@ def test_run_rollouts_with_max_concurrent(mock_openai_client):
             max_concurrent=2,
         )
     )
-    assert len(results["state"]) == 3
+    states = outputs["outputs"]
+    assert len(states) == 3
 
 
-def test_run_rollouts_with_semaphore(mock_openai_client):
-    env = _make_env(mock_openai_client)
-    inputs = [
-        RolloutInput(
-            prompt=[{"role": "user", "content": "hi"}],
-            answer="",
-            example_id=i,
-        )
-        for i in range(3)
-    ]
-    results = asyncio.run(
-        env.generate(
-            inputs,
-            client=mock_openai_client,
-            model="test-model",
-            max_concurrent=2,
-        )
-    )
-    assert len(results["state"]) == 3
-
-
-def test_evaluate_fallback_and_repeat(mock_openai_client):
+def test_evaluate_fallback_and_repeat(mock_openai_client, make_dummy_env, make_input):
     # No eval_dataset provided -> falls back to train; ensure >= num_examples
     from datasets import Dataset
 
     ds = Dataset.from_dict({"question": ["q1", "q2"], "answer": ["a1", "a2"]})
-    env = _make_env(mock_openai_client, dataset=ds)
-    res = asyncio.run(
+    env = make_dummy_env(mock_openai_client, dataset=ds)
+    outputs = asyncio.run(
         env.evaluate(
             client=mock_openai_client,
             model="test-model",
@@ -215,23 +178,21 @@ def test_evaluate_fallback_and_repeat(mock_openai_client):
         )
     )
     # Expect n * r rollouts in outputs
-    assert len(res["prompt"]) == 2 * 2
-    assert len(res["completion"]) == 2 * 2
+    states = outputs["outputs"]
+    assert len(states) == 2 * 2
 
 
 @pytest.mark.asyncio
-async def test_generate_inside_running_loop(mock_openai_client):
-    env = _make_env(mock_openai_client)
-    inputs = [
-        RolloutInput(
-            prompt=[{"role": "user", "content": "Hi"}],
-            answer="",
-            example_id=0,
-        )
-    ]
+async def test_generate_inside_running_loop(
+    mock_openai_client, make_dummy_env, make_input
+):
+    env = make_dummy_env(mock_openai_client)
+    inputs = [make_input(example_id=0)]
     # Call the async API directly inside a running event loop to avoid nested sync wrapper issues
-    out = await env.generate(inputs, client=mock_openai_client, model="test-model")
-    assert "completion" in out and len(out["completion"]) == 1
+    outputs = await env.generate(inputs, client=mock_openai_client, model="test-model")
+    states = outputs["outputs"]
+    assert len(states) == 1
+    assert states[0].get("completion") is not None
 
 
 def test_sanitize_tool_calls_outputs_strings():
@@ -257,26 +218,7 @@ def test_sanitize_tool_calls_outputs_strings():
     assert isinstance(sanitized[0]["tool_calls"][0], str)
 
 
-def test_make_dataset_basic_without_tools(mock_openai_client):
-    results = GenerateOutputs(
-        prompt=[[{"role": "user", "content": "Hi"}]],
-        completion=[[{"role": "assistant", "content": "Hello"}]],
-        answer=[""],
-        state=[
-            {
-                "timing": {
-                    "generation_ms": 0.0,
-                    "scoring_ms": 0.0,
-                    "total_ms": 0.0,
-                }
-            }
-        ],
-        info=[{}],
-        task=["default"],
-        reward=[1.0],
-        metrics={"foo": [0.1]},
-        example_id=[0],
-        metadata=_make_metadata(num_examples=1),
-    )
+def test_make_dataset_basic_without_tools(make_metadata, make_output):
+    results = GenerateOutputs(outputs=[make_output()], metadata=make_metadata())
     ds = build_dataset(results)
     assert len(ds) == 1 and "foo" in ds.column_names

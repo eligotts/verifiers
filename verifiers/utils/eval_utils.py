@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
-import json
 import logging
 import time
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
+
+from datasets import disable_progress_bar, enable_progress_bar
+from datasets.utils import logging as ds_logging
 
 try:
     import tomllib  # type: ignore[import-not-found]
@@ -20,23 +23,20 @@ import numpy as np
 import verifiers as vf
 
 if TYPE_CHECKING:
-    from datasets import Dataset
+    pass
 from verifiers.types import (
     Endpoints,
     EvalConfig,
     EvalRunConfig,
-    GenerateMetadata,
     GenerateOutputs,
     LogCallback,
     ProgressCallback,
+    RolloutOutput,
     StartCallback,
-    State,
 )
 from verifiers.utils.async_utils import EventLoopLagMonitor
 from verifiers.utils.client_utils import setup_client
-from verifiers.utils.error_utils import ErrorChain
 from verifiers.utils.logging_utils import print_prompt_completions_sample, print_time
-from verifiers.utils.message_utils import messages_to_printable, sanitize_tool_calls
 from verifiers.utils.path_utils import get_eval_results_path
 
 logger = logging.getLogger(__name__)
@@ -184,54 +184,40 @@ def load_toml_config(path: Path) -> list[dict]:
     return merged_eval_list
 
 
-def get_results_by_task(results: GenerateOutputs) -> dict[str, GenerateOutputs]:
-    """Group results by task name.
+def to_col_order(list_of_dicts: list[Mapping[str, float]]) -> dict[str, list[float]]:
+    """Convert a list of mappings to a dictionary of lists, ordered by the keys of the first mapping."""
+    if not list_of_dicts:
+        return {}
+    return {k: [m[k] for m in list_of_dicts] for k in list_of_dicts[0].keys()}
 
-    Args:
-        results: The GenerateOutputs from an evaluation run.
 
-    Returns:
-        A dictionary mapping task names to their corresponding GenerateOutputs.
-    """
-    task_indices: dict[str, list[int]] = {}
-    for i, task in enumerate(results["task"]):
-        if task not in task_indices:
-            task_indices[task] = []
-        task_indices[task].append(i)
-
-    task_results: dict[str, GenerateOutputs] = {}
-    for task, indices in task_indices.items():
-        task_results[task] = GenerateOutputs(
-            prompt=[results["prompt"][i] for i in indices],
-            completion=[results["completion"][i] for i in indices],
-            answer=[results["answer"][i] for i in indices],
-            state=[results["state"][i] for i in indices],
-            task=[results["task"][i] for i in indices],
-            info=[results["info"][i] for i in indices],
-            example_id=[results["example_id"][i] for i in indices],
-            reward=[results["reward"][i] for i in indices],
-            metrics={k: [v[i] for i in indices] for k, v in results["metrics"].items()},
-            stop_conditions=[results["stop_conditions"][i] for i in indices],
-            is_truncated=[results["is_truncated"][i] for i in indices],
-            metadata=results["metadata"],
-        )
-    return task_results
+def get_task_outputs(results: GenerateOutputs, task: str) -> GenerateOutputs:
+    """Get only the rollouts for a given task."""
+    outputs = [o for o in results["outputs"] if o["task"] == task]
+    return GenerateOutputs(
+        outputs=outputs,
+        metadata=results["metadata"],  # duplicate metadata
+    )
 
 
 def print_rewards(results: GenerateOutputs):
+    rewards = [o["reward"] for o in results["outputs"]]
     print("Rewards:")
     print(
-        f"reward: avg - {sum(results['reward']) / len(results['reward']):.3f}, std - {np.std(results['reward']):.3f}"
+        f"reward: avg - {sum(rewards) / len(rewards):.3f}, std - {np.std(rewards):.3f}"
     )
     r = results["metadata"]["rollouts_per_example"]
-    n = len(results["reward"]) // r
+    n = len(rewards) // r
     # results are sorted by example_id, so rollout i is at indices [i, i+r, i+2r, ...]
     for i in range(r):
-        trials = [round(results["reward"][i + (j * r)], 3) for j in range(n)]
+        trials = [round(rewards[i + (j * r)], 3) for j in range(n)]
         out = f"r{i + 1}: {trials}"
         print(out)
-    for k in results["metrics"]:
-        v = results["metrics"][k]
+
+    metrics = [o["metrics"] for o in results["outputs"]]
+    metrics_col = to_col_order(metrics)
+    for k in metrics_col.keys():
+        v = metrics_col[k]
         print(f"{k}: avg - {sum(v) / len(v):.3f}, std - {np.std(v):.3f}")
         for i in range(r):
             trials = [round(v[i + (j * r)], 3) for j in range(n)]
@@ -240,34 +226,36 @@ def print_rewards(results: GenerateOutputs):
 
 
 def print_info(results: GenerateOutputs):
+    is_truncated = [o["is_truncated"] for o in results["outputs"]]
     print("Info:")
     print(
-        f"is_truncated: avg - {np.mean(results['is_truncated']):.3f}, std - {np.std(results['is_truncated']):.3f}"
+        f"is_truncated: avg - {np.mean(is_truncated):.3f}, std - {np.std(is_truncated):.3f}"
     )
-    counter = Counter(results["stop_conditions"])
+    stop_conditions = [o["stop_condition"] for o in results["outputs"]]
+    counter = Counter(stop_conditions)
     print(
         f"stop_conditions: {', '.join([f'{k}: {v / counter.total():.3f}' for k, v in counter.items()])}"
     )
-    errors = [s.get("error") for s in results["state"]]
+    errors = [o.get("error") for o in results["outputs"]]
     has_errors = [e is not None for e in errors]
     if any(has_errors):
         print(
             f"errors: avg - {np.mean(has_errors):.3f}, std - {np.std(has_errors):.3f}"
         )
-        errors = [e for e in errors if e is not None]
-        error_chains = [ErrorChain(e) for e in errors]
-        counter = Counter(error_chains)
-        for error_chain, count in counter.items():
-            print(f" - {repr(error_chain)}: {count / counter.total():.3f}")
+        error_strs = [e for e in errors if e is not None]
+        # Errors are serialized as strings, count unique error types
+        counter = Counter(error_strs)
+        for error_str, count in counter.items():
+            print(f" - {error_str}: {count / counter.total():.3f}")
 
 
 def print_timing(results: GenerateOutputs):
     print("Timing:")
-    generation_ms_arr = np.array(
-        [s["timing"]["generation_ms"] for s in results["state"]]
-    )
-    scoring_ms_arr = np.array([s["timing"]["scoring_ms"] for s in results["state"]])
-    total_ms_arr = np.array([s["timing"]["total_ms"] for s in results["state"]])
+    timing = [o["timing"] for o in results["outputs"]]
+    timing_col = to_col_order(timing)
+    generation_ms_arr = np.array(timing_col["generation_ms"])
+    scoring_ms_arr = np.array(timing_col["scoring_ms"])
+    total_ms_arr = np.array(timing_col["total_ms"])
     generation_arr = generation_ms_arr / 1000
     scoring_arr = scoring_ms_arr / 1000
     total_arr = total_ms_arr / 1000
@@ -283,10 +271,7 @@ def print_timing(results: GenerateOutputs):
     )
 
 
-def print_results(
-    results: GenerateOutputs,
-    num_samples: int = 1,
-):
+def print_results(results: GenerateOutputs, num_samples: int = 1):
     assert results["metadata"] is not None
     print("--- Evaluation ---")
     print(f"Environment: {results['metadata']['env_id']}")
@@ -296,14 +281,18 @@ def print_results(
     print(f"Rollouts per example: {results['metadata']['rollouts_per_example']}")
     print("--- Example ---")
 
-    printable_prompts = [messages_to_printable(p) for p in results["prompt"]]
-    printable_completions = [messages_to_printable(c) for c in results["completion"]]
-    errors = [s.get("error") for s in results["state"]]
+    # prompt/completion are already in printable format from state_to_output
+    printable_prompts = [o["prompt"] if o["prompt"] else [] for o in results["outputs"]]
+    printable_completions = [
+        o["completion"] if o["completion"] else [] for o in results["outputs"]
+    ]
+    rewards = [o["reward"] for o in results["outputs"]]
+    errors = [o.get("error") for o in results["outputs"]]
     print_prompt_completions_sample(
         printable_prompts,
         printable_completions,
         errors,
-        results["reward"],
+        rewards,
         step=0,
         num_samples=num_samples,
     )
@@ -312,14 +301,26 @@ def print_results(
     print_info(results)
     print_timing(results)
 
-    num_tasks = len(set(results["task"]))
-    if num_tasks > 1:
-        task_results = get_results_by_task(results)
-        for task, task_results in task_results.items():
+    tasks = set([o["task"] for o in results["outputs"]])
+    if len(tasks) > 1:
+        for task in tasks:
+            task_results = get_task_outputs(results, task)
             print(f"\n--- {task} ---")
             print_rewards(task_results)
             print_info(task_results)
             print_timing(task_results)
+
+
+@contextmanager
+def quiet_datasets():
+    prev_level = ds_logging.get_verbosity()
+    ds_logging.set_verbosity(ds_logging.WARNING)
+    disable_progress_bar()
+    try:
+        yield
+    finally:
+        ds_logging.set_verbosity(prev_level)
+        enable_progress_bar()
 
 
 async def run_evaluation(
@@ -350,7 +351,7 @@ async def run_evaluation(
     )
     # disable tqdm when callbacks are provided (TUI handles progress display)
     use_tqdm = config.use_tqdm and on_progress is None
-    results = await vf_env.evaluate(
+    outputs = await vf_env.evaluate(
         client=client,
         model=config.model,
         sampling_args=config.sampling_args,
@@ -373,7 +374,7 @@ async def run_evaluation(
         on_log=on_log,
     )
 
-    return results
+    return outputs
 
 
 async def run_evaluations(config: EvalRunConfig) -> None:
@@ -436,20 +437,22 @@ async def run_evaluations_tui(config: EvalRunConfig, tui_mode: bool = True) -> N
             num_examples = total // env_config.rollouts_per_example
             display.update_env_state(env_idx, total=total, num_examples=num_examples)
 
-        def on_progress(all_states: list[State], new_states: list[State]) -> None:
+        def on_progress(
+            all_outputs: list[RolloutOutput], new_outputs: list[RolloutOutput]
+        ) -> None:
             nonlocal error_accum, reward_accum, metrics_accum
 
             # Progress is always rollout-based
-            completed = len(all_states)
+            completed = len(all_outputs)
 
-            for s in new_states:
-                if s.get("error") is not None:
+            for o in new_outputs:
+                if o.get("error") is not None:
                     error_accum += 1
-                reward = s.get("reward")
+                reward = o.get("reward")
                 if reward is not None:
                     reward_accum += reward
-                state_metrics = s.get("metrics") or {}
-                for name, value in state_metrics.items():
+                output_metrics = o.get("metrics") or {}
+                for name, value in output_metrics.items():
                     if value is not None:
                         metrics_accum[name] += value
 
@@ -514,108 +517,3 @@ async def run_evaluations_tui(config: EvalRunConfig, tui_mode: bool = True) -> N
 
     # print final summary after exit
     display.print_final_summary()
-
-
-def sanitize_metadata(metadata: GenerateMetadata) -> dict:
-    metadata_dict = dict(metadata)
-    metadata_dict.pop("path_to_save")
-    metadata_dict.pop("date")
-
-    return metadata_dict
-
-
-def get_hf_hub_dataset_name(results: GenerateOutputs) -> str:
-    metadata = results["metadata"]
-    dataset_name = (
-        metadata["env_id"]
-        + "_"
-        + metadata["model"].replace("/", "_")
-        + "_n"
-        + str(metadata["num_examples"])
-        + "_r"
-        + str(metadata["rollouts_per_example"])
-    )
-    return dataset_name
-
-
-def make_dataset(results: GenerateOutputs, **kwargs) -> Dataset:
-    from datasets import Dataset
-
-    clean_prompts = [messages_to_printable(p) for p in results["prompt"]]
-    clean_prompts = [sanitize_tool_calls(p) for p in clean_prompts]
-    clean_completions = [messages_to_printable(c) for c in results["completion"]]
-    clean_completions = [sanitize_tool_calls(c) for c in clean_completions]
-    save_info = any(info != {} for info in results["info"])
-    save_answer = any(answer != "" for answer in results["answer"])
-    errors = [s.get("error") for s in results["state"]]
-    results_dict = {
-        "example_id": results["example_id"],
-        "prompt": clean_prompts,
-        "completion": clean_completions,
-        "task": results["task"],
-        "reward": results["reward"],
-        "error": [repr(e) if e is not None else None for e in errors],
-        "generation_ms": [s["timing"]["generation_ms"] for s in results["state"]],
-        "scoring_ms": [s["timing"]["scoring_ms"] for s in results["state"]],
-        "total_ms": [s["timing"]["total_ms"] for s in results["state"]],
-    }
-    if save_info:
-        results_dict["info"] = results["info"]
-    if save_answer:
-        results_dict["answer"] = results["answer"]
-    for k in results["metrics"]:
-        v = results["metrics"][k]
-        results_dict[k] = v
-
-    # Add selected state columns if specified
-    state_columns = results["metadata"]["state_columns"]
-    if state_columns:
-        for col in state_columns:
-            if col == "responses":
-                results_dict[col] = [
-                    [r.model_dump() for r in s.get(col, [])] for s in results["state"]
-                ]
-            else:
-                results_dict[col] = [s.get(col) for s in results["state"]]
-
-    return Dataset.from_dict(results_dict)
-
-
-@contextmanager
-def quiet_datasets():
-    from datasets import disable_progress_bar, enable_progress_bar
-    from datasets.utils import logging as ds_logging
-
-    prev_level = ds_logging.get_verbosity()
-    ds_logging.set_verbosity(ds_logging.WARNING)
-    disable_progress_bar()
-    try:
-        yield
-    finally:
-        ds_logging.set_verbosity(prev_level)
-        enable_progress_bar()
-
-
-def save_to_disk(dataset: Dataset, metadata_dict: dict, path_to_save: Path):
-    path_to_save.parent.mkdir(parents=True, exist_ok=True)
-    with quiet_datasets():
-        dataset.to_json(path_to_save / "results.jsonl")
-    with open(path_to_save / "metadata.json", "w") as f:
-        json.dump(metadata_dict, f)
-
-
-def save_rollout_results(
-    results: GenerateOutputs,
-    push_to_hf_hub: bool = False,
-    hf_hub_dataset_name: str | None = None,
-):
-    path_to_save = results["metadata"]["path_to_save"]
-    path_to_save.parent.mkdir(parents=True, exist_ok=True)
-    dataset = make_dataset(results)
-    metadata_dict = sanitize_metadata(results["metadata"])
-    save_to_disk(dataset, metadata_dict, path_to_save)
-    logger.info(f"Results saved to {path_to_save}")
-    if push_to_hf_hub:
-        dataset_name = hf_hub_dataset_name or get_hf_hub_dataset_name(results)
-        dataset.push_to_hub(dataset_name)
-        logger.info(f"Dataset saved to Hugging Face Hub: {dataset_name}")
