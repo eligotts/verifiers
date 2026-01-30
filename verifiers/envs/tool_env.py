@@ -6,7 +6,7 @@ from openai.types.chat import ChatCompletionAssistantMessageParam
 import verifiers as vf
 from verifiers.types import Messages
 from verifiers.utils.async_utils import maybe_await
-from verifiers.utils.tool_utils import convert_func_to_oai_tool
+from verifiers.utils.tool_utils import convert_func_to_oai_tool, is_valid_tool_content_parts
 
 
 class ToolMonitorRubric(vf.Rubric):
@@ -133,7 +133,7 @@ class ToolEnv(vf.MultiTurnEnv):
         """Call a tool based on JSON command."""
         tool_func = self.tool_map[tool_name]
         result = await maybe_await(tool_func, **tool_args)
-        content = result if isinstance(result, list) else str(result)
+        content = result if is_valid_tool_content_parts(result) else str(result)
         return cast(
             vf.Message,
             {"role": "tool", "content": content, "tool_call_id": tool_call_id},
