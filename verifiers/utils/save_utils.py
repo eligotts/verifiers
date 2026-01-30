@@ -11,12 +11,15 @@ from pydantic import BaseModel
 
 from verifiers.types import (
     ChatCompletionToolParam,
+    ClientConfig,
+    ErrorInfo,
     GenerateMetadata,
     GenerateOutputs,
     RolloutOutput,
     SamplingArgs,
     State,
 )
+from verifiers.utils.error_utils import ErrorChain
 from verifiers.utils.message_utils import messages_to_printable, sanitize_tool_calls
 from verifiers.utils.path_utils import get_results_path
 
@@ -106,6 +109,7 @@ def state_to_output(state: State, state_columns: list[str] = []) -> RolloutOutpu
         is_truncated=state.get("is_truncated", False),
         stop_condition=state.get("stop_condition", None),
         metrics=state.get("metrics", {}),
+        oai_tools=state.get("oai_tools", None),
     )
     # sanitize messages (handle None for error cases)
     prompt = state.get("prompt")
@@ -116,7 +120,14 @@ def state_to_output(state: State, state_columns: list[str] = []) -> RolloutOutpu
         output["completion"] = sanitize_tool_calls(messages_to_printable(completion))
     # use repr for error
     if state.get("error") is not None:
-        output["error"] = repr(state.get("error"))
+        error_chain = ErrorChain(state.get("error"))
+        output["error"] = ErrorInfo(
+            error=type(state.get("error")).__name__,
+            error_chain_repr=repr(error_chain),
+            error_chain_str=str(error_chain),
+        )
+        output["error_chain"] = repr(error_chain)
+        output["long_error_chain"] = str(error_chain)
     # only include optional fields if non-empty
     if "answer" in output and not output["answer"]:
         output.pop("answer")
@@ -160,7 +171,7 @@ class GenerateOutputsBuilder:
         env_id: str,
         env_args: dict,
         model: str,
-        client: AsyncOpenAI,
+        client: AsyncOpenAI | ClientConfig,
         state_columns: list[str] | None,
         sampling_args: SamplingArgs,
         results_path: Path | None,
@@ -179,13 +190,12 @@ class GenerateOutputsBuilder:
         # Track tools from states for metadata
         self._tools_list: list[list[ChatCompletionToolParam] | None] = []
 
-    def add_states(self, new_states: list[State]) -> list[RolloutOutput]:
-        """Convert new states to outputs and accumulate. Returns the new outputs."""
-        new_outputs = states_to_outputs(new_states, self.state_columns)
+    def add_outputs(self, new_outputs: list[RolloutOutput]) -> list[RolloutOutput]:
+        """Convert new outputs to outputs and accumulate. Returns the new outputs."""
         self.outputs.extend(new_outputs)
         # Track tools for metadata computation
-        for state in new_states:
-            self._tools_list.append(state.get("oai_tools"))
+        for output in new_outputs:
+            self._tools_list.append(output.get("oai_tools"))
         return new_outputs
 
     def build(self, sort_by_example_id: bool = False) -> GenerateOutputs:
@@ -198,8 +208,12 @@ class GenerateOutputsBuilder:
 
     def _compute_metadata(self, outputs: list[RolloutOutput]) -> GenerateMetadata:
         """Compute metadata from accumulated outputs."""
-        base_url = str(self.client.base_url) if hasattr(self.client, "base_url") else ""
-
+        if isinstance(self.client, ClientConfig):
+            base_url = self.client.api_base_url
+        else:
+            base_url = (
+                str(self.client.base_url) if hasattr(self.client, "base_url") else ""
+            )
         # Compute reward stats from outputs
         rewards = [o.get("reward", 0.0) for o in outputs]
         avg_reward = sum(rewards) / len(rewards) if rewards else 0.0

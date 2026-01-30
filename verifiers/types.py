@@ -100,6 +100,12 @@ class RolloutTiming(TypedDict, total=False):
     total_ms: float
 
 
+class ErrorInfo(TypedDict):
+    error: str
+    error_chain_repr: str
+    error_chain_str: str
+
+
 class RolloutOutput(dict):
     """Serialized output from a rollout (mirrors RolloutInput).
 
@@ -126,7 +132,7 @@ class RolloutOutput(dict):
     # Optional fields
     answer: str
     info: Info
-    error: str | None
+    error: ErrorInfo | None
     stop_condition: str | None
     trajectory: list["TrajectoryStep"]
     oai_tools: list["ChatCompletionToolParam"]
@@ -234,6 +240,7 @@ Endpoints = dict[str, Endpoint]
 class ClientConfig(BaseModel):
     """Pydantic model for OpenAI client configuration."""
 
+    client_idx: int = 0
     api_key_var: str = "PRIME_API_KEY"
     api_base_url: str = "https://api.pinference.ai/api/v1"
     timeout: float = 3600.0
@@ -257,8 +264,6 @@ class EvalConfig(BaseModel):
     num_examples: int
     rollouts_per_example: int
     max_concurrent: int
-    max_concurrent_generation: int | None = None
-    max_concurrent_scoring: int | None = None
     independent_scoring: bool = False
     extra_env_kwargs: dict = {}
     max_retries: int = 0
